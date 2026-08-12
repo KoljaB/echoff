@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "echoff"
+version = "0.1.0"
+description = "Echo off: real-time AEC with synchronized system-audio and microphone capture"
+readme = "README.md"
+requires-python = ">=3.11"
+keywords = ["audio", "aec", "echo-cancellation", "webrtc", "wasapi"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
+  "Typing :: Typed",
+]
+dependencies = [
+  "livekit>=1.1.14,<2",
+  "PyAudioWPatch==0.2.12.8; sys_platform == 'win32'",
+  "sounddevice>=0.5.5,<1; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2",
+  "mypy>=1.15",
+  "pytest>=8.3",
+  "pytest-cov>=6",
+  "ruff>=0.11",
+]
+
+[project.scripts]
+echoff = "echoff.cli:main"
+
+[project.urls]
+Documentation = "https://github.com/KoljaB/echoff/tree/main/docs"
+Issues = "https://github.com/KoljaB/echoff/issues"
+Repository = "https://github.com/KoljaB/echoff"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+echoff = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+follow_imports = "skip"
