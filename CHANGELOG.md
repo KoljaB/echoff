@@ -2,7 +2,12 @@
 
 All notable changes will be documented here.
 
-## 0.1.2 - 2026-08-12
+## 0.1.3 - 2026-08-12
+
+- License Echoff under the MIT License and publish the license in package
+  metadata and distributions.
+
+## 0.1.2 - 2026-08-12 (TestPyPI only)
 
 - Rebuild the README and documentation around PyPI-first onboarding, clear API
   ownership routes, hardware validation, troubleshooting, and a searchable

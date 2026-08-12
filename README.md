@@ -2,6 +2,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/echoff.svg)](https://pypi.org/project/echoff/)
 [![Python](https://img.shields.io/pypi/pyversions/echoff.svg)](https://pypi.org/project/echoff/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/KoljaB/echoff/blob/main/LICENSE)
 [![Typed](https://img.shields.io/badge/typing-py.typed-2f74c0)](https://peps.python.org/pep-0561/)
 [![Windows capture](https://img.shields.io/badge/live_capture-Windows-0078d4)](https://github.com/KoljaB/echoff/blob/main/docs/platforms.md)
 
@@ -25,9 +26,8 @@ cancellation. Headphones make the comparison easiest to hear:
 > physically tested on Windows. The processor APIs are designed for
 > application-owned aligned PCM on other platforms where the LiveKit dependency
 > installs, but those paths are not CI- or hardware-qualified here and Linux and
-> macOS capture backends are not implemented. APIs and artifact schemas may change before
-> 1.0. No distribution license has been selected yet;
-> review [License](#license) before adopting the project.
+> macOS capture backends are not implemented. APIs and artifact schemas may
+> change before 1.0. Echoff is licensed under the MIT License.
 
 ## Support at a glance
 
@@ -236,6 +236,4 @@ for the editable install, deterministic tests, and hardware-evidence contract.
 
 ## License
 
-No distribution license has been selected yet. Until the repository owner adds
-one, the repository provides no grant to copy, modify, or redistribute the
-source. This is a real adoption limitation, not a documentation placeholder.
+Echoff is open source under the [MIT License](https://github.com/KoljaB/echoff/blob/main/LICENSE).

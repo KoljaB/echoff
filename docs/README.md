@@ -48,4 +48,4 @@ Echoff 0.1 is alpha software. Built-in physical capture is supported on
 Windows. The Linux and macOS processor paths are designed for applications that
 already own correctly aligned PCM and environments where LiveKit installs;
 they are not CI- or hardware-qualified by this project. The repository
-currently has no distribution license grant.
+is licensed under the [MIT License](../LICENSE).
