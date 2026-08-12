@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "echoff"
-version = "0.1.0"
+version = "0.1.1"
 description = "Echo off: real-time AEC with synchronized system-audio and microphone capture"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -114,7 +114,7 @@ def run_probe(config: ProbeConfig) -> dict[str, Any]:
     play_wav = None if config.play_wav is None else config.play_wav.resolve()
     if play_wav is not None and not play_wav.is_file():
         raise FileNotFoundError(play_wav)
-    playback_windows: list[tuple[float, float]] = []
+    playback_windows_absolute: list[tuple[float, float]] = []
     capture = AecCapture(
         config.aec,
         output_dir=output,
@@ -136,10 +136,17 @@ def run_probe(config: ProbeConfig) -> dict[str, Any]:
             for index in range(config.repetitions):
                 LOGGER.info("playing stimulus %d/%d: %s", index + 1, config.repetitions, play_wav)
                 started, ended = _play_wav(capture, play_wav, config.volume)
-                playback_windows.append((capture.elapsed_s(started), capture.elapsed_s(ended)))
+                playback_windows_absolute.append((started, ended))
                 if index + 1 < config.repetitions:
                     _wait(capture, config.gap_s)
             _wait(capture, config.tail_s)
+        timeline_origin = capture.timeline_started_monotonic
+        if timeline_origin is None:
+            raise RuntimeError("capture produced no artifact timeline")
+        playback_windows = [
+            (started - timeline_origin, ended - timeline_origin)
+            for started, ended in playback_windows_absolute
+        ]
         capture.set_summary_metadata(
             probe={
                 "play_wav": None if play_wav is None else str(play_wav),

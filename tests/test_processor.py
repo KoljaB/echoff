@@ -4,7 +4,13 @@ import math
 import unittest
 from typing import ClassVar
 
-from echoff import AecConfig, WebRtcAecProcessor
+from echoff import (
+    AecConfig,
+    BufferedWebRtcAecProcessor,
+    PassthroughAecProcessor,
+    StreamingWebRtcAecProcessor,
+    WebRtcAecProcessor,
+)
 from echoff.errors import AudioBackendError
 
 
@@ -140,6 +146,59 @@ class WebRtcAecProcessorTests(unittest.TestCase):
         for offset in range(0, total, 960):
             retained.extend(near_processor.process_pair([0.0] * 960, near[offset : offset + 960]))
         self.assertGreater(rms(retained[2 * rate :]), 0.40 * rms(near[2 * rate :]))
+
+    def test_streaming_adapter_preserves_reverse_before_microphone_order(self) -> None:
+        processor = StreamingWebRtcAecProcessor(
+            AecConfig(),
+            _rtc=FakeRtc,
+            _apm_type=FakeApm,
+        )
+        processor.process_reference([0.2] * 960)
+        output = processor.process_microphone([0.1] * 960)
+        self.assertEqual(len(output), 960)
+        self.assertEqual(
+            FakeApm.instances[-1].calls,
+            ["reference", "reference", "microphone", "microphone"],
+        )
+
+    def test_streaming_adapter_reset_clears_pending_frames(self) -> None:
+        processor = StreamingWebRtcAecProcessor(
+            AecConfig(),
+            _rtc=FakeRtc,
+            _apm_type=FakeApm,
+        )
+        processor.process_reference([0.2] * 240)
+        processor.reset_alignment()
+        processor.process_reference([0.2] * 240)
+        self.assertEqual(FakeApm.instances[-1].calls, [])
+
+    def test_buffered_pairs_interleave_frames_and_flush_exact_tail(self) -> None:
+        processor = BufferedWebRtcAecProcessor(
+            AecConfig(),
+            _rtc=FakeRtc,
+            _apm_type=FakeApm,
+        )
+        first = processor.process_pair([0.2] * 1000, [0.1] * 1000)
+        tail = processor.flush()
+        self.assertEqual(len(first), 960)
+        self.assertEqual(len(tail), 40)
+        self.assertEqual(
+            FakeApm.instances[-1].calls,
+            [
+                "reference",
+                "microphone",
+                "reference",
+                "microphone",
+                "reference",
+                "microphone",
+            ],
+        )
+
+    def test_passthrough_processor_returns_microphone_unchanged(self) -> None:
+        processor = PassthroughAecProcessor()
+        self.assertEqual(processor.process_pair([0.0, 0.0], [0.1, -0.2]), (0.1, -0.2))
+        processor.reset_alignment()
+        self.assertEqual(processor.state.stream_alignment_reset_count, 1)
 
 
 if __name__ == "__main__":

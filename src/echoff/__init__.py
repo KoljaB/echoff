@@ -11,7 +11,13 @@ from .errors import (
     UnsupportedPlatformError,
 )
 from .models import AecFrame, AecState, CaptureEvent, CaptureStatus, DeviceInfo
-from .processor import WebRtcAecProcessor
+from .processor import (
+    BufferedWebRtcAecProcessor,
+    PassthroughAecProcessor,
+    StreamingWebRtcAecProcessor,
+    WebRtcAecProcessor,
+)
+from .recording import PcmWavRecorder
 
 __all__ = [
     "AecCapture",
@@ -20,14 +26,18 @@ __all__ = [
     "AecFrame",
     "AecState",
     "AudioBackendError",
+    "BufferedWebRtcAecProcessor",
     "CaptureEvent",
     "CaptureStateError",
     "CaptureStatus",
     "DeviceInfo",
+    "PassthroughAecProcessor",
+    "PcmWavRecorder",
+    "StreamingWebRtcAecProcessor",
     "UnsupportedPlatformError",
     "WebRtcAecProcessor",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())

@@ -49,6 +49,7 @@ class RecordingAndAnalysisTests(unittest.TestCase):
                 duration_s=1.0,
                 error=None,
                 metadata={},
+                timeline_started_monotonic=123.0,
             )
 
             report = analyze_capture(

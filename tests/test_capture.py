@@ -76,12 +76,14 @@ class AecCaptureTests(unittest.TestCase):
         )
         processor = FakeProcessor()
         frames = []
+        references = []
         events = []
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "capture"
             with AecCapture(
                 AecConfig(),
                 on_frame=frames.append,
+                on_reference=lambda samples, ended: references.append((samples, ended)),
                 on_event=events.append,
                 output_dir=output,
                 processor=processor,
@@ -90,6 +92,7 @@ class AecCaptureTests(unittest.TestCase):
                 capture.raise_if_failed()
 
             self.assertEqual(len(frames), 3)
+            self.assertEqual([ended for _samples, ended in references], [0.02, 0.04, 0.06])
             self.assertEqual(len(processor.pairs), 3)
             self.assertTrue(all(source.stopped for source in sources))
             frame_counts = set()
@@ -102,6 +105,8 @@ class AecCaptureTests(unittest.TestCase):
             summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["status"], "completed")
             self.assertTrue(summary["tracks_share_timeline"])
+            self.assertAlmostEqual(summary["timeline_started_monotonic"], 0.0)
+            self.assertEqual(capture.timeline_started_monotonic, 0.0)
             self.assertEqual(summary["capture"]["processed_pair_count"], 3)
             kinds = [event.kind for event in events]
             self.assertIn("alignment_locked", kinds)
@@ -130,6 +135,21 @@ class AecCaptureTests(unittest.TestCase):
             self.assertEqual(summary["capture"]["runtime_dropped_reference_blocks"], 2)
             counts = {track["frames"] for track in summary["tracks"].values()}
             self.assertEqual(counts, {4_800})
+
+    def test_reference_callback_receives_unmatched_and_paired_blocks_once(self) -> None:
+        factory, _sources = factory_for(
+            [(1.0, 0.02), (2.0, 0.04), (3.0, 0.06)],
+            [(0.3, 0.06)],
+        )
+        references = []
+        capture = AecCapture(
+            processor=FakeProcessor(),
+            source_factory=factory,
+            on_reference=lambda samples, ended: references.append((samples[0], ended)),
+        )
+        capture.start()
+        capture.stop()
+        self.assertEqual(references, [(1.0, 0.02), (2.0, 0.04), (3.0, 0.06)])
 
     def test_capture_instance_cannot_be_restarted(self) -> None:
         factory, _sources = factory_for([(1.0, 0.02)], [(1.0, 0.02)])

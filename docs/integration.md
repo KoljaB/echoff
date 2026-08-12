@@ -33,6 +33,17 @@ clean = processor.process_pair(reference_20ms, microphone_20ms)
 Both inputs must be 48 kHz mono and contain the same number of samples. Their
 length must be a multiple of 480 samples (10 ms).
 
+Deterministic replay pipelines that already own one shared clock can instead
+use `StreamingWebRtcAecProcessor`: feed the continuous far-end with
+`process_reference()` and clean replay microphone blocks with
+`process_microphone()`. It is deliberately not a substitute for timestamp
+alignment between independent physical devices.
+
+If replay already supplies exact paired blocks with arbitrary call boundaries,
+use `BufferedWebRtcAecProcessor.process_pair()` and call `flush()` once at the
+end. This preserves native reference/microphone interleaving without requiring
+the host application to implement 10-ms frame buffering.
+
 ## Application policy stays outside
 
 The library exposes `frame.state.echo_path_ready`. A voice application may use

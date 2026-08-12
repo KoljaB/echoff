@@ -105,6 +105,11 @@ clean_microphone = processor.process_pair(reference_samples, microphone_samples)
 `process_pair()` is intentionally atomic: the far-end reference is always
 submitted immediately before its matching microphone frame.
 
+Deterministic replay pipelines with one shared clock may use
+`StreamingWebRtcAecProcessor` to submit continuous reference and microphone
+streams separately. Physical device capture should always use `AecCapture` so
+timestamp alignment remains active.
+
 ## Design guarantees
 
 - One worker owns reference/microphone pairing and APM call order.

@@ -61,6 +61,7 @@ class AecCapture:
         config: AecConfig | None = None,
         *,
         on_frame: Callable[[AecFrame], None] | None = None,
+        on_reference: Callable[[tuple[float, ...], float], None] | None = None,
         on_event: Callable[[CaptureEvent], None] | None = None,
         output_dir: str | Path | None = None,
         reference_device: str | None = None,
@@ -70,6 +71,7 @@ class AecCapture:
     ) -> None:
         self.config = config or AecConfig()
         self.on_frame = on_frame or (lambda _frame: None)
+        self.on_reference = on_reference or (lambda _samples, _ended: None)
         self.on_event = on_event or (lambda _event: None)
         self.output_dir = None if output_dir is None else Path(output_dir).resolve()
         self.reference_device = reference_device
@@ -91,6 +93,7 @@ class AecCapture:
         self._ever_started = False
         self._started_monotonic: float | None = None
         self._started_utc: str | None = None
+        self._timeline_started_monotonic: float | None = None
         self._summary_metadata: dict[str, Any] = {}
         self._reference_sample_count = 0
         self._microphone_sample_count = 0
@@ -176,6 +179,12 @@ class AecCapture:
             raise CaptureStateError("capture has not started")
         return (time.monotonic() if monotonic is None else monotonic) - self._started_monotonic
 
+    @property
+    def timeline_started_monotonic(self) -> float | None:
+        """Monotonic origin of sample zero in the artifact WAV timeline."""
+
+        return self._timeline_started_monotonic
+
     def stop(self, *, error: str | None = None, status_name: str | None = None) -> None:
         with self._state_lock:
             if not self._running:
@@ -222,6 +231,7 @@ class AecCapture:
                     duration_s=max(0.0, time.monotonic() - self._started_monotonic),
                     error=effective_error,
                     metadata=dict(self._summary_metadata),
+                    timeline_started_monotonic=self._timeline_started_monotonic,
                 )
             except Exception as exc:
                 LOGGER.exception("capture artifact finalization failed")
@@ -412,7 +422,9 @@ class AecCapture:
             if decision.action is AlignmentAction.DROP_REFERENCE:
                 if decision.starts_realigning:
                     self._start_realignment(decision.skew_s)
+                self._deliver_reference(reference)
                 if self._artifacts is not None:
+                    self._note_artifact_timeline(reference)
                     self._artifacts.write_unmatched_reference(reference.samples)
                 reference = None
                 continue
@@ -420,18 +432,21 @@ class AecCapture:
                 if decision.starts_realigning:
                     self._start_realignment(decision.skew_s)
                 if self._artifacts is not None:
+                    self._note_artifact_timeline(microphone)
                     self._artifacts.write_unmatched_microphone(microphone.samples)
                 microphone = None
                 continue
 
             if self._processor is None:  # pragma: no cover - guarded by start
                 raise CaptureStateError("AEC processor is not initialized")
+            self._deliver_reference(reference)
             started = time.perf_counter()
             clean = self._processor.process_pair(reference.samples, microphone.samples)
             elapsed = time.perf_counter() - started
             self._processing_total_s += elapsed
             self._processing_max_s = max(self._processing_max_s, elapsed)
             if self._artifacts is not None:
+                self._note_artifact_timeline(microphone)
                 self._artifacts.write_pair(reference.samples, microphone.samples, clean)
             frame = AecFrame(
                 reference=reference.samples,
@@ -482,6 +497,15 @@ class AecCapture:
             1000.0 * skew_s,
         )
 
+    def _deliver_reference(self, block: AudioBlock) -> None:
+        self.on_reference(block.samples, block.ended_monotonic)
+
+    def _note_artifact_timeline(self, block: AudioBlock) -> None:
+        if self._timeline_started_monotonic is None:
+            self._timeline_started_monotonic = (
+                block.ended_monotonic - len(block.samples) / self.config.sample_rate
+            )
+
     def _drain_reference_tail(self, pending: AudioBlock | None) -> None:
         items = [] if pending is None else [pending]
         while True:
@@ -494,7 +518,12 @@ class AecCapture:
         self._aligner.note_shutdown_unpaired("reference", len(items))
         if self._artifacts is not None:
             for item in items:
+                self._deliver_reference(item)
+                self._note_artifact_timeline(item)
                 self._artifacts.write_unmatched_reference(item.samples)
+        else:
+            for item in items:
+                self._deliver_reference(item)
 
     def _drain_microphone_tail(self, pending: AudioBlock | None) -> None:
         items = [] if pending is None else [pending]
@@ -508,4 +537,5 @@ class AecCapture:
         self._aligner.note_shutdown_unpaired("microphone", len(items))
         if self._artifacts is not None:
             for item in items:
+                self._note_artifact_timeline(item)
                 self._artifacts.write_unmatched_microphone(item.samples)

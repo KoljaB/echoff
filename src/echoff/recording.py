@@ -246,6 +246,7 @@ class CaptureArtifacts:
         duration_s: float,
         error: str | None,
         metadata: dict[str, Any],
+        timeline_started_monotonic: float | None,
     ) -> Path:
         self.close_tracks()
         tracks = {
@@ -258,6 +259,7 @@ class CaptureArtifacts:
             "started_utc": started_utc,
             "ended_utc": ended_utc,
             "duration_s": duration_s,
+            "timeline_started_monotonic": timeline_started_monotonic,
             "capture": capture_status.to_dict(),
             "tracks": tracks,
             "tracks_share_timeline": len(frame_counts) == 1,
