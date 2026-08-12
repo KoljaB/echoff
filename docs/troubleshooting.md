@@ -26,7 +26,7 @@ Readiness advances only while paired far-end RMS is at least 0.001. Silent
 capture is expected to remain cold. Play normal computer audio for at least
 3.25 seconds.
 
-## Linux or macOS reports unsupported platform
+## Linux reports unsupported platform
 
-Those capture adapters are not implemented in version 0.1. The processor can
+The Linux capture adapter is not implemented in version 0.1. The processor can
 still be used with application-owned, already aligned PCM streams.

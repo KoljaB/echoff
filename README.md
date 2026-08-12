@@ -17,7 +17,6 @@ microphone frames and decide what to do with them.
 |---|---|---|
 | Windows | Supported | WASAPI loopback and microphone through PyAudioWPatch, with WDM-KS microphone fallback |
 | Linux | Planned | PipeWire sink monitor and microphone source |
-| macOS | Planned | ScreenCaptureKit/CoreAudio system-audio capture and microphone source |
 
 The WebRTC processor and timestamp aligner are platform-neutral. Only the device
 capture adapters are platform-specific.
