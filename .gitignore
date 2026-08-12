@@ -10,5 +10,7 @@ build/
 dist/
 captures/
 *.wav
+!assets/original_signal.wav
+!assets/aec_signal.wav
 *.jsonl
 run.log

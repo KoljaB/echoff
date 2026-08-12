@@ -123,6 +123,28 @@ class _ThreadedSource:
     def _run(self) -> None:
         raise NotImplementedError
 
+    def _take_device_block(
+        self,
+        device_queue: queue.Queue[bytes],
+        *,
+        timeout_s: float,
+        discard_surplus: bool,
+    ) -> bytes | None:
+        """Wait briefly for one device block and optionally collapse stale surplus."""
+
+        try:
+            payload = device_queue.get(timeout=max(0.0, timeout_s))
+        except queue.Empty:
+            return None
+        if discard_surplus:
+            while device_queue.qsize() > 1:
+                try:
+                    payload = device_queue.get_nowait()
+                except queue.Empty:
+                    break
+                self.dropped_device_block_count += 1
+        return payload
+
 
 class WasapiReferenceSource(_ThreadedSource):
     """Clock-continuous capture of a Windows render endpoint."""
@@ -172,6 +194,7 @@ class WasapiReferenceSource(_ThreadedSource):
         pyaudio = _load_pyaudio()
         audio = pyaudio.PyAudio()
         stream = None
+        reader: threading.Thread | None = None
         try:
             info = self._select_device(audio)
             self.selected_device_name = str(info.get("name") or "") or None
@@ -186,6 +209,23 @@ class WasapiReferenceSource(_ThreadedSource):
                 input_device_index=self.selected_device_index,
                 frames_per_buffer=block_frames,
             )
+            device_queue: queue.Queue[bytes] = queue.Queue()
+            reader_error: list[Exception] = []
+
+            def read_device() -> None:
+                try:
+                    while not self.stop_event.is_set():
+                        device_queue.put(stream.read(block_frames, exception_on_overflow=False))
+                except Exception as exc:
+                    if not self.stop_event.is_set():
+                        reader_error.append(exc)
+
+            reader = threading.Thread(
+                target=read_device,
+                name="echoff-reference-reader",
+                daemon=True,
+            )
+            reader.start()
             self.ready_event.set()
             LOGGER.info(
                 "reference device ready: %s (index %s)",
@@ -193,14 +233,27 @@ class WasapiReferenceSource(_ThreadedSource):
                 self.selected_device_index,
             )
             scale = 1.0 / 32768.0
-            next_tick = time.monotonic()
+            next_tick = time.monotonic() + self.config.block_duration_s
             silence = [0.0] * block_frames
+            reference_state = "unknown"
             while not self.stop_event.is_set():
-                next_tick += self.config.block_duration_s
                 if self.stop_event.wait(max(0.0, next_tick - time.monotonic())):
                     break
-                if stream.get_read_available() >= block_frames:
-                    payload = stream.read(block_frames, exception_on_overflow=False)
+                if reader_error:
+                    raise reader_error[0]
+                wait_budget_s = (
+                    self.config.reference_stall_grace_s
+                    if reference_state != "idle"
+                    else min(0.018, self.config.block_duration_s * 0.9)
+                )
+                payload = self._take_device_block(
+                    device_queue,
+                    timeout_s=max(0.0, next_tick + wait_budget_s - time.monotonic()),
+                    discard_surplus=False,
+                )
+                if reader_error:
+                    raise reader_error[0]
+                if payload is not None:
                     pcm = array("h")
                     pcm.frombytes(payload)
                     if channels == 1:
@@ -211,15 +264,32 @@ class WasapiReferenceSource(_ThreadedSource):
                             for index in range(0, len(pcm) - channels + 1, channels)
                         ]
                     self.device_block_count += 1
-                else:
-                    samples = silence
+                    reference_state = "active"
+                    self.callback(samples, next_tick)
+                    next_tick += self.config.block_duration_s
+                    continue
+
+                # A blocking loopback read may complete slightly after its nominal
+                # scheduler tick. While the endpoint is active (or its state is not
+                # known yet), preserve that tick for a bounded grace period instead
+                # of inserting silence and relabelling the real block as the next
+                # tick. Once the grace expires, classify the endpoint as idle and
+                # catch the synthetic clock up in one bounded burst. Idle ticks use
+                # only the short normal read margin, so microphone delivery does not
+                # inherit the full stall grace while the endpoint is silent.
+                reference_state = "idle"
+                now = time.monotonic()
+                while next_tick <= now + 1e-9 and not self.stop_event.is_set():
                     self.synthetic_silence_block_count += 1
-                self.callback(samples, next_tick)
+                    self.callback(silence, next_tick)
+                    next_tick += self.config.block_duration_s
         finally:
             if stream is not None:
                 try:
                     stream.stop_stream()
                 finally:
+                    if reader is not None:
+                        reader.join(timeout=1.0)
                     stream.close()
             audio.terminate()
 
@@ -365,28 +435,6 @@ class WasapiMicrophoneSource(_ThreadedSource):
             while not self.stop_event.wait(0.05):
                 if callback_error:
                     raise callback_error[0]
-
-    def _take_device_block(
-        self,
-        device_queue: queue.Queue[bytes],
-        *,
-        timeout_s: float,
-        discard_surplus: bool,
-    ) -> bytes | None:
-        """Take one block while retaining one device-clock reserve block."""
-
-        try:
-            payload = device_queue.get(timeout=max(0.0, timeout_s))
-        except queue.Empty:
-            return None
-        if discard_surplus:
-            while device_queue.qsize() > 1:
-                try:
-                    payload = device_queue.get_nowait()
-                except queue.Empty:
-                    break
-                self.dropped_device_block_count += 1
-        return payload
 
     def _run(self) -> None:
         pyaudio = _load_pyaudio()

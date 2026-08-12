@@ -1,7 +1,9 @@
 # Architecture
 
-The package has one job: produce a microphone stream cleaned with the exact
-system-audio reference that could have reached the loudspeakers.
+[Documentation home](README.md)
+
+The package has one job: produce a microphone stream cleaned with the captured
+render-endpoint reference that could have reached the loudspeakers.
 
 ```text
 Windows system audio ----> reference source ----> timestamp queue --+
@@ -22,7 +24,7 @@ Physical microphone -----> microphone source ---> timestamp queue --+
 - `capture.py` coordinates source lifetime and one pairing worker.
 - `recording.py` writes recoverable WAV and JSON artifacts.
 - `analysis.py` reads artifacts and computes signal-level diagnostics.
-- `cli.py` provides device and recording commands.
+- `cli.py` provides device, recording, and read-only analysis commands.
 
 No module owns both platform device I/O and WebRTC processing.
 
@@ -35,9 +37,10 @@ Every block therefore carries its monotonic end time.
 The aligner compares the two queue heads:
 
 - Within tolerance: process one pair.
-- Reference is older: preserve its raw recording but do not submit it to APM.
-- Microphone is older: preserve its raw recording and write equal-duration
-  silence to the clean recording.
+- Reference is older: do not submit it to APM; deliver it to `on_reference` and,
+  when artifacts are enabled, preserve it on the shared WAV timeline.
+- Microphone is older: do not submit it to APM; when artifacts are enabled,
+  preserve the raw mic and write equal-duration silence to the other tracks.
 
 After the first pair, a discontinuity starts a realignment episode. The APM is
 reset once, stale heads are removed, and normal processing resumes on the next
@@ -53,10 +56,15 @@ The default capture block is 20 ms, so every call contains two APM frames.
 
 ## Echo-path readiness
 
-Adaptive echo cancellation needs real far-end energy before its filter has
-converged. `echo_path_ready` becomes true after 3.25 seconds of paired reference
-frames with RMS at or above 0.001. Silence and unpaired frames do not advance
-the counter. A realignment resets it.
+`echo_path_ready` is a conservative warm-up heuristic, not a measurement or
+guarantee of WebRTC filter convergence. With the default configuration it
+becomes true after 3.25 seconds of paired reference frames with RMS at or above
+0.001. Silence and unpaired frames do not advance the counter. A realignment
+resets it.
 
-This is a signal state, not an application policy. Applications decide whether
-to defer VAD or barge-in while the path is cold.
+This is a signal-derived state, not an application policy. Applications decide
+whether to defer VAD or barge-in while the path is cold and must still validate
+physical suppression on their hardware.
+
+Next: [Integration](integration.md) · [Python API](python-api.md) ·
+[Platform support](platforms.md)

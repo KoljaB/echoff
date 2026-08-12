@@ -59,13 +59,19 @@ def parse_window(value: str) -> tuple[float, float]:
         raise ValueError(f"invalid window {value!r}; expected START:END")
     start = float(start_text)
     end = float(end_text)
-    if start < 0.0 or end <= start:
+    if not math.isfinite(start) or not math.isfinite(end) or start < 0.0 or end <= start:
         raise ValueError(f"invalid window {value!r}")
     return start, end
 
 
 def _window(samples: Sequence[float], rate: int, start: float, end: float) -> Sequence[float]:
-    return samples[round(start * rate) : round(end * rate)]
+    if not math.isfinite(start) or not math.isfinite(end) or start < 0.0 or end <= start:
+        raise ValueError(f"invalid analysis window {start}:{end}")
+    start_index = round(start * rate)
+    end_index = round(end * rate)
+    if start_index < 0 or end_index <= start_index or end_index > len(samples):
+        raise ValueError(f"window {start}:{end} is outside the shared microphone timeline")
+    return samples[start_index:end_index]
 
 
 def _level_comparison(
@@ -206,6 +212,7 @@ def analyze_capture(
     *,
     far_end_windows: Sequence[tuple[float, float]] = (),
     near_end_windows: Sequence[tuple[float, float]] = (),
+    write_report: bool = True,
 ) -> dict[str, Any]:
     root = Path(capture_dir).resolve()
     reference, reference_rate = read_wav(root / "computer_audio.wav")
@@ -245,14 +252,15 @@ def analyze_capture(
             raw_rate,
             near_end_windows,
         )
-    path = root / "analysis.json"
-    temporary = root / ".analysis.json.tmp"
-    if path.exists() or temporary.exists():
-        raise FileExistsError(path if path.exists() else temporary)
-    payload = (json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()
-    with temporary.open("xb") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.rename(temporary, path)
+    if write_report:
+        path = root / "analysis.json"
+        temporary = root / ".analysis.json.tmp"
+        if path.exists() or temporary.exists():
+            raise FileExistsError(path if path.exists() else temporary)
+        payload = (json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()
+        with temporary.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.rename(temporary, path)
     return report

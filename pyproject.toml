@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "echoff"
-version = "0.1.1"
+version = "0.1.2"
 description = "Echo off: real-time AEC with synchronized system-audio and microphone capture"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -34,12 +34,16 @@ dev = [
   "pytest-cov>=6",
   "ruff>=0.11",
 ]
+release = [
+  "build>=1.2",
+  "twine>=6,<7",
+]
 
 [project.scripts]
 echoff = "echoff.cli:main"
 
 [project.urls]
-Documentation = "https://github.com/KoljaB/echoff/tree/main/docs"
+Documentation = "https://github.com/KoljaB/echoff/blob/main/docs/README.md"
 Issues = "https://github.com/KoljaB/echoff/issues"
 Repository = "https://github.com/KoljaB/echoff"
 

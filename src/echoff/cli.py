@@ -24,6 +24,7 @@ def _add_log_level(parser: argparse.ArgumentParser) -> None:
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         type=str.upper,
+        help="console/file logging threshold (default: INFO)",
     )
 
 
@@ -39,24 +40,92 @@ def build_parser() -> argparse.ArgumentParser:
     _add_log_level(devices)
 
     record = subparsers.add_parser("record", help="record an inspectable hardware session")
-    record.add_argument("--duration", type=float, default=15.0)
-    record.add_argument("--output", type=Path)
-    record.add_argument("--reference-device")
-    record.add_argument("--microphone-device")
-    record.add_argument("--stream-delay-ms", type=int, default=50)
-    record.add_argument("--noise-suppression", action="store_true")
-    record.add_argument("--play-wav", type=Path)
-    record.add_argument("--repetitions", type=int, default=1)
-    record.add_argument("--pre-roll", type=float, default=2.0)
-    record.add_argument("--gap", type=float, default=1.0)
-    record.add_argument("--tail", type=float, default=1.0)
-    record.add_argument("--volume", type=int, default=100)
+    record.add_argument(
+        "--duration",
+        type=float,
+        default=15.0,
+        help=(
+            "positive ambient duration in seconds (default: 15; with --play-wav, "
+            "stimulus timing controls runtime)"
+        ),
+    )
+    record.add_argument(
+        "--output",
+        type=Path,
+        help="new or empty artifact directory (default: captures/echoff-TIMESTAMP)",
+    )
+    record.add_argument(
+        "--reference-device",
+        help="WASAPI loopback index or unique case-insensitive name fragment",
+    )
+    record.add_argument(
+        "--microphone-device",
+        help="WASAPI microphone index or unique case-insensitive name fragment",
+    )
+    record.add_argument(
+        "--stream-delay-ms",
+        type=int,
+        default=50,
+        help="WebRTC render-to-capture delay hint in milliseconds (default: 50)",
+    )
+    record.add_argument(
+        "--noise-suppression",
+        action="store_true",
+        help="enable WebRTC noise suppression in addition to AEC",
+    )
+    record.add_argument(
+        "--play-wav",
+        type=Path,
+        help="play a WAV through ffplay as a repeatable far-end stimulus",
+    )
+    record.add_argument(
+        "--repetitions",
+        type=int,
+        default=1,
+        help="number of stimulus playbacks (default: 1)",
+    )
+    record.add_argument(
+        "--pre-roll",
+        type=float,
+        default=2.0,
+        help="quiet seconds before the first stimulus (default: 2)",
+    )
+    record.add_argument(
+        "--gap",
+        type=float,
+        default=1.0,
+        help="seconds between stimulus repetitions (default: 1)",
+    )
+    record.add_argument(
+        "--tail",
+        type=float,
+        default=1.0,
+        help="seconds captured after the last stimulus (default: 1)",
+    )
+    record.add_argument(
+        "--volume",
+        type=int,
+        default=100,
+        help="ffplay stimulus volume from 0 to 100 (default: 100)",
+    )
     _add_log_level(record)
 
     analyze = subparsers.add_parser("analyze", help="analyze an existing capture directory")
-    analyze.add_argument("capture_dir", type=Path)
-    analyze.add_argument("--far-end-window", action="append", default=[])
-    analyze.add_argument("--near-end-window", action="append", default=[])
+    analyze.add_argument("capture_dir", type=Path, help="directory containing the three WAV tracks")
+    analyze.add_argument(
+        "--far-end-window",
+        action="append",
+        default=[],
+        metavar="START:END",
+        help="far-end-only interval in seconds; repeat for multiple windows",
+    )
+    analyze.add_argument(
+        "--near-end-window",
+        action="append",
+        default=[],
+        metavar="START:END",
+        help="near-end speech interval in seconds; repeat for multiple windows",
+    )
     _add_log_level(analyze)
     return parser
 
@@ -114,6 +183,7 @@ def _run_analyze(args: argparse.Namespace) -> int:
         args.capture_dir,
         far_end_windows=[parse_window(value) for value in args.far_end_window],
         near_end_windows=[parse_window(value) for value in args.near_end_window],
+        write_report=False,
     )
     print(json.dumps(report, indent=2))
     return 0

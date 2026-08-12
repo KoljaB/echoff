@@ -106,6 +106,8 @@ class AecCapture:
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         try:
             self.stop(error=None if exc is None else str(exc))
+            if exc is None:
+                self.raise_if_failed()
         except Exception:
             if exc is None:
                 raise
@@ -277,6 +279,13 @@ class AecCapture:
         )
         reference = self._reference
         microphone = self._microphone
+        errors: list[str] = []
+        if reference is not None and reference.error is not None:
+            errors.append(f"reference source failed: {reference.error}")
+        if microphone is not None and microphone.error is not None:
+            errors.append(f"microphone source failed: {microphone.error}")
+        if self._processing_error is not None:
+            errors.append(f"capture processing failed: {self._processing_error}")
         pair_count = snapshot.pair_count
         return CaptureStatus(
             running=self._running,
@@ -340,7 +349,7 @@ class AecCapture:
                 0.0 if pair_count <= 0 else 1000.0 * self._processing_total_s / pair_count
             ),
             processing_max_ms=1000.0 * self._processing_max_s,
-            error=None if self._processing_error is None else str(self._processing_error),
+            error=None if not errors else "; ".join(errors),
         )
 
     def _emit(self, kind: str, **details: Any) -> None:

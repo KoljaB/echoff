@@ -1,9 +1,12 @@
 # Logging
 
-The library uses Python's standard `logging` package under the `echoff`
-logger hierarchy. It never installs handlers on import.
+[Documentation home](README.md)
 
-Applications can configure logging explicitly:
+Echoff uses Python's `echoff` logger hierarchy. Importing the package attaches
+only a `NullHandler`; it never configures the root logger or installs an
+emitting handler behind the application's back.
+
+Applications may use ordinary `logging` configuration or the opt-in helper:
 
 ```python
 from echoff.log import configure_logging
@@ -11,8 +14,17 @@ from echoff.log import configure_logging
 configure_logging(level="DEBUG", log_file="aec.log")
 ```
 
-The CLI accepts `--log-level DEBUG|INFO|WARNING|ERROR` and writes both console
-output and `run.log` in the capture directory.
+Repeated helper calls update Echoff-managed handlers instead of duplicating
+them. They do not alter unrelated root handlers.
 
-Human logs explain what happened. `events.jsonl` and `summary.json` are the
-machine-readable audit trail and should be preferred by automation.
+CLI behavior:
+
+- `echoff record` logs to the console and `run.log` in its artifact directory.
+- `echoff devices` and `echoff analyze` log to the console only.
+- all commands accept `--log-level DEBUG|INFO|WARNING|ERROR`.
+
+Human logs explain what happened. Prefer `events.jsonl`, `summary.json`, and
+`analysis.json` for automation because their schemas and structured values are
+more stable than prose.
+
+Next: [Capture artifacts](capture-artifacts.md) · [Python API](python-api.md)

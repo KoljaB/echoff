@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -41,6 +42,13 @@ def empty_status() -> CaptureStatus:
 
 
 class RecordingAndAnalysisTests(unittest.TestCase):
+    def test_probe_rejects_nonfinite_timing_without_opening_devices(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "capture"
+            for field in ("duration_s", "pre_roll_s", "gap_s", "tail_s"):
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    ProbeConfig(output_dir=output, **{field: math.nan})
+
     def test_probe_window_contract_is_explicitly_process_timed(self) -> None:
         self.assertEqual(PLAYBACK_WINDOW_KIND, "ffplay_process_lifetime")
         self.assertEqual(ANALYSIS_EDGE_TRIM_S, 0.25)
@@ -72,6 +80,28 @@ class RecordingAndAnalysisTests(unittest.TestCase):
             self.assertTrue((output / "analysis.json").is_file())
             with self.assertRaises(FileExistsError):
                 analyze_capture(output)
+            with self.assertRaisesRegex(ValueError, "outside the shared microphone timeline"):
+                analyze_capture(
+                    output,
+                    far_end_windows=[(0.0, 999.0)],
+                    write_report=False,
+                )
+            with self.assertRaisesRegex(ValueError, "invalid analysis window"):
+                analyze_capture(
+                    output,
+                    near_end_windows=[(-1.0, 0.5)],
+                    write_report=False,
+                )
+            read_only_report = analyze_capture(
+                output,
+                far_end_windows=[(0.0, 1.0)],
+                write_report=False,
+            )
+            self.assertAlmostEqual(
+                read_only_report["far_end_only"]["echo_suppression_db"],
+                20.0,
+                places=1,
+            )
             summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
             self.assertTrue(summary["tracks_share_timeline"])
             with self.assertRaises(FileExistsError):

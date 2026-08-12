@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
-from echoff.cli import build_parser
+from echoff.cli import build_parser, main
 from echoff.log import configure_logging, parse_log_level, shutdown_logging
 
 
@@ -45,6 +50,33 @@ class LoggingAndCliTests(unittest.TestCase):
         self.assertEqual(args.command, "record")
         self.assertEqual(args.duration, 5.0)
         self.assertEqual(args.log_level, "DEBUG")
+
+    def test_analyze_cli_is_read_only_and_prints_report(self) -> None:
+        report = {"schema_version": "echoff-analysis-v1"}
+        output = StringIO()
+        with (
+            patch("echoff.cli.analyze_capture", return_value=report) as analyze,
+            redirect_stdout(output),
+        ):
+            self.assertEqual(main(["analyze", "capture"]), 0)
+        analyze.assert_called_once_with(
+            Path("capture"),
+            far_end_windows=[],
+            near_end_windows=[],
+            write_report=False,
+        )
+        self.assertEqual(__import__("json").loads(output.getvalue()), report)
+
+    def test_module_entrypoint_propagates_main_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = Path(temporary) / "missing-capture"
+            result = subprocess.run(
+                [sys.executable, "-m", "echoff", "analyze", str(missing)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 1)
 
 
 if __name__ == "__main__":

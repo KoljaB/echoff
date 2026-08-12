@@ -1,154 +1,241 @@
 # Echoff
 
-**Echo off. Clean microphone on.**
+[![PyPI](https://img.shields.io/pypi/v/echoff.svg)](https://pypi.org/project/echoff/)
+[![Python](https://img.shields.io/pypi/pyversions/echoff.svg)](https://pypi.org/project/echoff/)
+[![Typed](https://img.shields.io/badge/typing-py.typed-2f74c0)](https://peps.python.org/pep-0561/)
+[![Windows capture](https://img.shields.io/badge/live_capture-Windows-0078d4)](https://github.com/KoljaB/echoff/blob/main/docs/platforms.md)
 
-`echoff` is a small Python library for real-time acoustic echo cancellation.
-It captures the audio rendered by the computer and the microphone on separate
-streams, aligns their timelines, and feeds matched 10 ms frame pairs to WebRTC's
-Audio Processing Module (APM).
+**Reduce computer-speaker audio leaking back into a live microphone stream.**
 
-The package deliberately does **not** contain voice activity detection, speech
-recognition, text-to-speech, or conversation policy. Applications receive clean
-microphone frames and decide what to do with them.
+Echoff is a focused Python package for synchronized duplex capture and real-time
+acoustic echo cancellation (AEC). It timestamp-aligns Windows system-audio
+loopback and microphone blocks *before* feeding matched frame pairs to WebRTC's
+Audio Processing Module. Applications receive the reference, raw microphone,
+and echo-reduced microphone PCM.
 
-## Current platform support
+## Hear the difference
 
-| Platform | Status | Capture backend |
+The same 14-second microphone capture, before and after Echoff's acoustic echo
+cancellation. Headphones make the comparison easiest to hear:
+
+- [▶ Original microphone signal — echo present](https://raw.githubusercontent.com/KoljaB/echoff/main/assets/original_signal.wav)
+- [▶ Echoff output — echo reduced](https://raw.githubusercontent.com/KoljaB/echoff/main/assets/aec_signal.wav)
+
+> **Project status:** Echoff 0.1 is alpha software. Built-in live capture is
+> physically tested on Windows. The processor APIs are designed for
+> application-owned aligned PCM on other platforms where the LiveKit dependency
+> installs, but those paths are not CI- or hardware-qualified here and Linux and
+> macOS capture backends are not implemented. APIs and artifact schemas may change before
+> 1.0. No distribution license has been selected yet;
+> review [License](#license) before adopting the project.
+
+## Support at a glance
+
+| Platform | Built-in live capture | Processor-only use with aligned PCM |
 |---|---|---|
-| Windows | Supported | WASAPI loopback and microphone through PyAudioWPatch, with WDM-KS microphone fallback |
-| Linux | Planned | PipeWire sink monitor and microphone source |
+| Windows 10/11 | **Supported**: WASAPI loopback + WASAPI microphone, with WDM-KS microphone fallback | Supported |
+| Linux | Planned: PipeWire backend | Designed for application-owned PCM where LiveKit installs; not qualified here |
+| macOS | Not implemented | Designed for application-owned PCM where LiveKit installs; not qualified here |
 
-The WebRTC processor and timestamp aligner are platform-neutral. Only the device
-capture adapters are platform-specific.
+Python 3.11 or newer is required. See [Platform support](https://github.com/KoljaB/echoff/blob/main/docs/platforms.md)
+for the exact boundary between portable processing and platform-specific
+capture.
 
-## Install
+## Three-minute Windows quickstart
 
-Echoff is published on [PyPI](https://pypi.org/project/echoff/) and currently
-supports live device capture on Windows with Python 3.11 or newer:
-
-```powershell
-python -m pip install echoff
-```
-
-The WebRTC processor and alignment components are platform-neutral; additional
-capture backends will be published as they receive physical hardware testing.
-
-## Install for development on Windows
+Create an isolated environment and install the published package:
 
 ```powershell
-git clone https://github.com/KoljaB/echoff D:\Projekte\echoff
-cd D:\Projekte\echoff
 py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install echoff
 ```
 
-## Five-minute hardware check
-
-List devices:
+List the endpoints Echoff can select:
 
 ```powershell
-echoff devices
+.\.venv\Scripts\python.exe -m echoff devices
 ```
 
-Record system audio, the raw microphone, and the AEC-cleaned microphone:
+Then start a 20-second evidence-preserving recording:
 
 ```powershell
-python examples\record_aec_session.py --duration 20 --log-level INFO
+.\.venv\Scripts\python.exe -m echoff record --duration 20
 ```
 
-While it runs, play any speech or music through the normal speakers. You may
-also speak into the microphone. The output directory contains:
+While it runs, play continuous speech or music through the normal speakers for
+at least five seconds. The default readiness heuristic needs 3.25 seconds of
+active, correctly paired reference audio. Speak for part of the run only if you
+also want to check that near-end speech survives. The command prints the
+artifact directory and writes:
 
 ```text
-computer_audio.wav
-microphone_raw.wav
-microphone_aec.wav
-events.jsonl
-config.json
-summary.json
-run.log
+computer_audio.wav   # captured render-endpoint reference
+microphone_raw.wav   # microphone before AEC
+microphone_aec.wav   # microphone after AEC
+events.jsonl         # lifecycle and alignment events
+config.json          # effective AEC configuration
+summary.json         # devices, counters, timing, and final status
+analysis.json        # signal-level diagnostics
+run.log              # human-readable CLI log
 ```
 
-For a repeatable loudspeaker stimulus, provide a WAV file:
+Listen first to `microphone_raw.wav` and `microphone_aec.wav`. Speaker playback
+should be lower in the AEC track while your own speech remains intelligible.
+The whole-run level difference is only descriptive when real microphone speech
+is present; use a controlled far-end-only window before calling a number echo
+suppression. The [hardware probe guide](https://github.com/KoljaB/echoff/blob/main/docs/hardware-probe.md)
+shows the repeatable path.
 
-```powershell
-python examples\record_aec_session.py `
-  --play-wav D:\audio\speech.wav `
-  --repetitions 3 `
-  --output D:\Temp\aec-probe
-```
+## Why Echoff exists
 
-See [Capture artifacts](docs/capture-artifacts.md) for the exact meaning of
-each file and [Hardware probe](docs/hardware-probe.md) for a repeatable test.
+System loopback and microphone devices start independently. Matching their
+first callbacks by arrival order can pair audio from different moments, leaving
+WebRTC with the wrong echo reference even when both streams have the same block
+count. Echoff instead:
 
-## Library API
+1. captures the render reference and microphone on separate streams;
+2. pairs blocks by monotonic end timestamp;
+3. realigns and resets the adaptive filter after a discontinuity; and
+4. submits each reference frame immediately before its matching microphone
+   frame.
+
+This is the capture-and-alignment layer that a bare AEC wrapper does not
+provide.
+
+## Choose the right API
+
+| Audio-source situation | Use | Why |
+|---|---|---|
+| Echoff should open the system-output loopback and microphone | `AecCapture` | Echoff captures, timestamp-aligns, processes, and optionally records both streams |
+| exact time-aligned reference/microphone pairs | `WebRtcAecProcessor` | One atomic call preserves reference-before-microphone ordering |
+| exact pairs with arbitrary block boundaries | `BufferedWebRtcAecProcessor` | Buffers partial 10 ms WebRTC frames and flushes the final tail |
+| deterministic streams on one shared clock | `StreamingWebRtcAecProcessor` | Accepts continuous reference and microphone input separately; performs no timestamp alignment |
+
+Do **not** use the streaming adapter for two independently clocked physical
+devices. Use `AecCapture` or align the streams before calling a processor.
+
+## Minimal application skeleton
+
+`on_frame` and `on_reference` run on Echoff's pairing thread, so move
+application work to a queue and poll capture health from the application loop:
 
 ```python
 import time
-from pathlib import Path
+from queue import Empty, Queue
 
 from echoff import AecCapture, AecConfig, AecFrame
 
-
-def consume(frame: AecFrame) -> None:
-    # 48 kHz mono floating-point samples in [-1.0, 1.0].
-    send_to_your_audio_pipeline(frame.microphone_clean)
+frames: Queue[AecFrame] = Queue()
 
 
-config = AecConfig(stream_delay_ms=50)
-with AecCapture(
-    config,
-    on_frame=consume,
-    output_dir=Path("capture-artifacts"),
-) as capture:
-    time.sleep(20)
-    print(capture.status())
+def handle_clean_audio(samples: tuple[float, ...]) -> None:
+    """Replace this with your VAD, recorder, stream, or ASR handoff."""
+    pass
+
+
+capture = AecCapture(AecConfig(), on_frame=frames.put)
+capture.start()
+try:
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        capture.raise_if_failed()
+        try:
+            frame = frames.get(timeout=0.1)
+        except Empty:
+            continue
+        handle_clean_audio(frame.microphone_clean)
+finally:
+    capture.stop()
+
+# Surface a device or processing failure that happened near shutdown.
+capture.raise_if_failed()
 ```
 
-For applications that already own their audio devices, use only the processor:
+This bounded-duration example uses an unbounded queue for clarity. Production
+applications need a bounded, non-blocking handoff and an explicit overload
+policy; blocking the callback stalls Echoff's pairing thread.
+
+`AecFrame` contains 48 kHz mono floating-point samples in `[-1.0, 1.0]`, the
+matched reference and raw microphone, both timestamps, pair skew, and an AEC
+state snapshot. An `AecCapture` instance is single-use.
+
+For an application that already owns aligned PCM:
 
 ```python
 from echoff import AecConfig, WebRtcAecProcessor
 
+reference_10ms = (0.0,) * 480
+microphone_10ms = (0.0,) * 480
 processor = WebRtcAecProcessor(AecConfig())
-clean_microphone = processor.process_pair(reference_samples, microphone_samples)
+clean_microphone = processor.process_pair(reference_10ms, microphone_10ms)
 ```
 
-`process_pair()` is intentionally atomic: the far-end reference is always
-submitted immediately before its matching microphone frame.
+Both inputs must be equal-length, 48 kHz mono floats and contain a whole number
+of 480-sample (10 ms) frames. Read [Integration](https://github.com/KoljaB/echoff/blob/main/docs/integration.md)
+before wiring physical devices or separate capture clocks.
 
-Deterministic replay pipelines with one shared clock may use
-`StreamingWebRtcAecProcessor` to submit continuous reference and microphone
-streams separately. Physical device capture should always use `AecCapture` so
-timestamp alignment remains active.
+## How the live path works
 
-## Design guarantees
+```text
+Windows output -> WASAPI loopback -> timestamp queue --+
+                                                       +-> align -> WebRTC APM -> AecFrame
+Physical mic  -> WASAPI / WDM-KS -> timestamp queue ---+
+```
 
-- One worker owns reference/microphone pairing and APM call order.
-- Capture blocks carry monotonic end timestamps.
-- Startup phase differences and later discontinuities are realigned instead of
-  silently pairing stale frames.
-- Every realignment starts a fresh AEC epoch exactly once.
-- The echo-path readiness signal advances only on paired, active far-end audio.
-- Libraries never configure the process-wide root logger.
-- Raw and processed audio can be recorded for every run.
+Startup phase differences and later discontinuities are realigned instead of
+silently pairing stale frames. Each realignment starts a fresh AEC epoch. The
+`echo_path_ready` state turns true only after 3.25 seconds of paired, active
+far-end audio; the application decides whether that state should gate VAD or
+barge-in.
 
-Read [Architecture](docs/architecture.md) and [Integration](docs/integration.md)
-before adding a new backend.
+This is continuous timestamp checking with runtime realignment, not automatic
+tuning of the WebRTC `stream_delay_ms` hint. A late block from an active Windows
+loopback stream keeps its original scheduler slot for a bounded 100 ms grace;
+only a longer absence is classified as endpoint idle and filled with
+clock-continuous silence.
+
+## Validate on your hardware
+
+For repeatable far-end-only evidence, confirm `ffplay -version`, choose a speech WAV,
+remain silent, and run:
+
+```powershell
+.\.venv\Scripts\python.exe -m echoff record `
+  --play-wav C:\audio\known-speech.wav `
+  --repetitions 3
+```
+
+Echoff preserves all three tracks plus the process-timed stimulus windows.
+Compare runs only after fixing endpoint, microphone, speaker position, volume,
+input WAV, and stream-delay setting. Do not tune acceptance thresholds after
+seeing the result.
+
+## Documentation
+
+- [Documentation home](https://github.com/KoljaB/echoff/blob/main/docs/README.md) — every guide, grouped by task.
+- [Getting started](https://github.com/KoljaB/echoff/blob/main/docs/getting-started.md) and [CLI](https://github.com/KoljaB/echoff/blob/main/docs/cli.md) — install, select devices, and complete the first capture.
+- [Integration](https://github.com/KoljaB/echoff/blob/main/docs/integration.md) and [Python API](https://github.com/KoljaB/echoff/blob/main/docs/python-api.md) — choose an ownership model and wire Echoff safely.
+- [Hardware probe](https://github.com/KoljaB/echoff/blob/main/docs/hardware-probe.md) and [Troubleshooting](https://github.com/KoljaB/echoff/blob/main/docs/troubleshooting.md) — validate real hardware and diagnose failures.
+- [Architecture](https://github.com/KoljaB/echoff/blob/main/docs/architecture.md) and [Platform support](https://github.com/KoljaB/echoff/blob/main/docs/platforms.md) — understand timing, realignment, and OS boundaries.
+
+## Privacy
+
+Diagnostic captures may contain private microphone speech and application
+audio. The default `captures\` tree and general WAV/JSONL/log patterns are
+ignored by this repository; only the two curated demo WAVs under `assets/` are
+explicitly exempt. Custom locations and JSON metadata are not guaranteed to be
+ignored. They are not encrypted; check `git status` and review every artifact
+before sharing.
 
 ## Development
 
-```powershell
-python -m unittest discover -s tests -v
-ruff check .
-mypy src
-python -m build
-```
-
-Hardware tests are deliberately separate from unit tests. Unit tests must not
-open devices or play audio.
+Clone the repository only when contributing. See [Contributing](https://github.com/KoljaB/echoff/blob/main/CONTRIBUTING.md)
+and [Development](https://github.com/KoljaB/echoff/blob/main/docs/development.md)
+for the editable install, deterministic tests, and hardware-evidence contract.
 
 ## License
 
 No distribution license has been selected yet. Until the repository owner adds
-one, the source is provided without a grant to copy, modify, or redistribute it.
+one, the repository provides no grant to copy, modify, or redistribute the
+source. This is a real adoption limitation, not a documentation placeholder.

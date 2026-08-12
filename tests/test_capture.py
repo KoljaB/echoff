@@ -159,6 +159,18 @@ class AecCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "cannot be restarted"):
             capture.start()
 
+    def test_context_manager_surfaces_asynchronous_source_failure(self) -> None:
+        factory, sources = factory_for([(1.0, 0.02)], [(1.0, 0.02)])
+        with (
+            self.assertRaisesRegex(AudioBackendError, "microphone source failed"),
+            AecCapture(
+                processor=FakeProcessor(),
+                source_factory=factory,
+            ) as capture,
+        ):
+            sources[1].error = RuntimeError("device disconnected")
+            self.assertIn("microphone source failed", capture.status().error or "")
+
     def test_one_source_stop_failure_does_not_skip_other_cleanup_or_summary(self) -> None:
         sources = []
 

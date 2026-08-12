@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import shutil
 import subprocess
 import time
@@ -35,12 +36,13 @@ class ProbeConfig:
     aec: AecConfig = field(default_factory=AecConfig)
 
     def __post_init__(self) -> None:
-        if self.duration_s <= 0.0:
-            raise ValueError("duration_s must be positive")
+        if not math.isfinite(self.duration_s) or self.duration_s <= 0.0:
+            raise ValueError("duration_s must be finite and positive")
         if self.repetitions <= 0:
             raise ValueError("repetitions must be positive")
-        if min(self.pre_roll_s, self.gap_s, self.tail_s) < 0.0:
-            raise ValueError("pre-roll, gap, and tail durations cannot be negative")
+        timings = (self.pre_roll_s, self.gap_s, self.tail_s)
+        if any(not math.isfinite(value) for value in timings) or min(timings) < 0.0:
+            raise ValueError("pre-roll, gap, and tail durations must be finite and non-negative")
         if not 0 <= self.volume <= 100:
             raise ValueError("volume must be between 0 and 100")
 
