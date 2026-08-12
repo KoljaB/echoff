@@ -16,6 +16,8 @@ from .capture import AecCapture
 from .config import AecConfig
 
 LOGGER = logging.getLogger(__name__)
+PLAYBACK_WINDOW_KIND = "ffplay_process_lifetime"
+ANALYSIS_EDGE_TRIM_S = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,7 +157,9 @@ def run_probe(config: ProbeConfig) -> dict[str, Any]:
                 "gap_s": config.gap_s,
                 "tail_s": config.tail_s,
                 "volume": config.volume,
+                "playback_window_kind": PLAYBACK_WINDOW_KIND,
                 "playback_windows_s": playback_windows,
+                "analysis_edge_trim_s": ANALYSIS_EDGE_TRIM_S,
             }
         )
     except KeyboardInterrupt:
@@ -176,7 +180,9 @@ def run_probe(config: ProbeConfig) -> dict[str, Any]:
     # Trim player startup/drain edges. These are echo-suppression windows only
     # when the operator followed the probe instruction to remain silent.
     far_end_windows = [
-        (start + 0.25, end - 0.25) for start, end in playback_windows if end - start > 0.6
+        (start + ANALYSIS_EDGE_TRIM_S, end - ANALYSIS_EDGE_TRIM_S)
+        for start, end in playback_windows
+        if end - start > 2.0 * ANALYSIS_EDGE_TRIM_S + 0.1
     ]
     analysis = analyze_capture(output, far_end_windows=far_end_windows)
     LOGGER.info("probe complete: %s", output)

@@ -8,7 +8,12 @@ from pathlib import Path
 from echoff import AecConfig
 from echoff.analysis import analyze_capture
 from echoff.models import CaptureStatus
-from echoff.probe import ProbeConfig, run_probe
+from echoff.probe import (
+    ANALYSIS_EDGE_TRIM_S,
+    PLAYBACK_WINDOW_KIND,
+    ProbeConfig,
+    run_probe,
+)
 from echoff.recording import CaptureArtifacts
 
 
@@ -36,6 +41,10 @@ def empty_status() -> CaptureStatus:
 
 
 class RecordingAndAnalysisTests(unittest.TestCase):
+    def test_probe_window_contract_is_explicitly_process_timed(self) -> None:
+        self.assertEqual(PLAYBACK_WINDOW_KIND, "ffplay_process_lifetime")
+        self.assertEqual(ANALYSIS_EDGE_TRIM_S, 0.25)
+
     def test_artifacts_are_exclusive_and_analysis_measures_declared_windows(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "capture"

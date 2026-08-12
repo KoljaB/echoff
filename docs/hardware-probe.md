@@ -27,8 +27,11 @@ python examples\record_aec_session.py `
 ```
 
 Remain silent unless the test plan explicitly asks for near-end speech. The CLI
-records exact playback windows in `summary.json` and computes raw-versus-clean
-RMS suppression in `analysis.json`.
+records the monotonic lifetime of each `ffplay` process in `summary.json` and
+computes raw-versus-clean RMS suppression over its stable interior in
+`analysis.json`. These are reproducible process-timing windows, not
+sample-accurate sound-card playback boundaries; `summary.json` records the
+window kind and the fixed edge trim explicitly.
 
 Do not tune thresholds after looking at a result. Device identity, volume,
 speaker position, stream delay, and input WAV should be fixed before comparing
