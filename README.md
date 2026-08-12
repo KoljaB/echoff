@@ -21,6 +21,18 @@ microphone frames and decide what to do with them.
 The WebRTC processor and timestamp aligner are platform-neutral. Only the device
 capture adapters are platform-specific.
 
+## Install
+
+Echoff is published on [PyPI](https://pypi.org/project/echoff/) and currently
+supports live device capture on Windows with Python 3.11 or newer:
+
+```powershell
+python -m pip install echoff
+```
+
+The WebRTC processor and alignment components are platform-neutral; additional
+capture backends will be published as they receive physical hardware testing.
+
 ## Install for development on Windows
 
 ```powershell

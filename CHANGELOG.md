@@ -2,7 +2,7 @@
 
 All notable changes will be documented here.
 
-## 0.1.1 - Unreleased
+## 0.1.1 - 2026-08-12
 
 - Add application-owned streaming and buffered paired processor APIs.
 - Expose every reference block to host applications without duplicating capture.
