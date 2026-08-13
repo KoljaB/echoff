@@ -61,23 +61,27 @@ emits the event, so it must be fast and thread-safe; its failures are logged and
 do not stop audio processing.
 
 Use `on_reference(samples, ended_monotonic)` when the application also consumes
-system audio. It receives every reference block exactly once, including blocks
-that cannot be paired during realignment. Use `on_event(event)` for low-volume
+the reference from each confirmed pair. Echoff emits no synthetic reference
+callback for an unmatched microphone block. The diagnostic
+`reference_received.wav` preserves every received raw reference payload. Use
+`on_event(event)` for low-volume
 structured lifecycle and alignment telemetry.
 
 ### Lifecycle and health
 
-- `start()` blocks until the first timestamp-aligned pair or the configured
-  startup timeout.
+- `start()` waits for initial source audio or the configured startup timeout;
+  alignment may still be joining or explicitly degraded when it returns.
 - An `AecCapture` object is single-use. Create a new instance after `stop()`.
 - Poll `raise_if_failed()` from the application's normal health loop.
-- `with AecCapture(...)` stops capture and propagates an asynchronous device or
-  processing failure when the block exits normally.
+- `with AecCapture(...)` stops capture and propagates an asynchronous processing
+  failure when the block exits normally. Source failures remain explicit
+  degraded status/events.
 - `stop()` is idempotent, stops both sources, drains the worker, and finalizes
   artifacts. Cleanup errors are raised after all cleanup paths have run.
-- A timestamp discontinuity is recoverable: Echoff realigns, resets APM once,
-  emits an event, and continues. A device failure or unbounded processing
-  backlog remains fatal.
+- Post-lock device-clock drift remains telemetry and does not change pair
+  identity or reset APM. Timestamp regressions and PortAudio status flags are
+  evidence, not session failures. Source failure degrades paired output; a
+  processing/callback failure or unsafe unbounded backlog remains fatal.
 
 If `output_dir` is set, Echoff reserves the artifact filenames exclusively and
 never overwrites an earlier run. Use a new directory per capture.
@@ -154,10 +158,11 @@ reference activity cannot advance echo-path readiness.
 
 ## Application policy stays outside
 
-`frame.state.echo_path_ready` indicates that enough paired active far-end audio
-has reached the current AEC epoch for the configured warm-up. A voice
-application may defer VAD or barge-in while local playback is active and the
-path is cold. Echoff itself does not discard microphone frames for this reason.
+`frame.state.echo_path_ready` indicates that the current AEC epoch passed both
+the configured active-reference warm-up and the rolling raw-to-clean
+suppression gate. A voice application may defer VAD or barge-in while local
+playback is active and the path is cold. Echoff itself does not discard
+microphone frames for this reason.
 
 Turn detection, playback interruption, resampling for ASR, speaker identity,
 and conversation history are application responsibilities. Avoid transcript
@@ -174,8 +179,8 @@ Catch `AecCaptureError` for expected package failures:
   capture instance or writing to a closed recorder.
 
 Preserve the artifact directory when diagnosing a physical run. It contains the
-selected devices, three time-aligned tracks, realignment events, and final
-status needed to separate bad AEC from bad input or routing.
+selected devices, three time-aligned tracks, skew counters, and final status
+needed to separate bad AEC from bad input or routing.
 
 Next: [Python API](python-api.md) · [Capture artifacts](capture-artifacts.md) ·
 [Troubleshooting](troubleshooting.md)

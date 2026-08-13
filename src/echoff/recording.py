@@ -16,7 +16,7 @@ from .config import AecConfig
 from .errors import CaptureStateError
 from .models import CaptureEvent, CaptureStatus
 
-ARTIFACT_SCHEMA = "echoff-capture-artifacts-v1"
+ARTIFACT_SCHEMA = "echoff-capture-artifacts-v2"
 
 
 def canonical_json_bytes(value: Any, *, pretty: bool = False) -> bytes:
@@ -137,6 +137,7 @@ class CaptureArtifacts:
     """Own all files belonging to one capture session."""
 
     TRACK_NAMES = ("computer_audio", "microphone_raw", "microphone_aec")
+    SOURCE_TRACK_NAMES = ("reference_received", "microphone_received")
 
     def __init__(self, output_dir: Path, config: AecConfig) -> None:
         self.output_dir = output_dir.resolve()
@@ -147,7 +148,10 @@ class CaptureArtifacts:
             self.output_dir / "summary.json",
             self.output_dir / "analysis.json",
             self.output_dir / ".analysis.json.tmp",
-            *(self.output_dir / f"{name}.wav" for name in self.TRACK_NAMES),
+            *(
+                self.output_dir / f"{name}.wav"
+                for name in (*self.TRACK_NAMES, *self.SOURCE_TRACK_NAMES)
+            ),
         ]
         existing = [path.name for path in reserved if path.exists()]
         if existing:
@@ -169,6 +173,18 @@ class CaptureArtifacts:
                 recorders.append(
                     PcmWavRecorder(self.output_dir / f"{name}.wav", config.sample_rate)
                 )
+            recorders.append(
+                PcmWavRecorder(
+                    self.output_dir / "reference_received.wav",
+                    config.sample_rate,
+                )
+            )
+            recorders.append(
+                PcmWavRecorder(
+                    self.output_dir / "microphone_received.wav",
+                    config.sample_rate,
+                )
+            )
         except Exception:
             for recorder in recorders:
                 recorder.close()
@@ -176,7 +192,13 @@ class CaptureArtifacts:
                 events.close()
             raise
         self.events = events
-        self.computer_audio, self.microphone_raw, self.microphone_aec = recorders
+        (
+            self.computer_audio,
+            self.microphone_raw,
+            self.microphone_aec,
+            self.reference_received,
+            self.microphone_received,
+        ) = recorders
         self._closed = False
 
     def write_pair(
@@ -191,19 +213,27 @@ class CaptureArtifacts:
         self.microphone_raw.write(microphone_raw)
         self.microphone_aec.write(microphone_clean)
 
-    def write_unmatched_reference(self, reference: Sequence[float]) -> None:
-        silence = (0.0,) * len(reference)
-        self.write_pair(reference, silence, silence)
+    def write_reference_received(self, reference: Sequence[float]) -> None:
+        """Preserve every real reference payload independently of live assignment."""
 
-    def write_unmatched_microphone(self, microphone: Sequence[float]) -> None:
-        silence = (0.0,) * len(microphone)
-        self.write_pair(silence, microphone, silence)
+        self.reference_received.write(reference)
+
+    def write_microphone_received(self, microphone: Sequence[float]) -> None:
+        """Preserve every real microphone payload independently of live AEC."""
+
+        self.microphone_received.write(microphone)
 
     def close_tracks(self) -> None:
         if self._closed:
             return
         errors: list[Exception] = []
-        for recorder in (self.computer_audio, self.microphone_raw, self.microphone_aec):
+        for recorder in (
+            self.computer_audio,
+            self.microphone_raw,
+            self.microphone_aec,
+            self.reference_received,
+            self.microphone_received,
+        ):
             try:
                 recorder.close()
             except Exception as exc:
@@ -252,6 +282,10 @@ class CaptureArtifacts:
         tracks = {
             name: self._wav_metadata(self.output_dir / f"{name}.wav") for name in self.TRACK_NAMES
         }
+        source_tracks = {
+            name: self._wav_metadata(self.output_dir / f"{name}.wav")
+            for name in self.SOURCE_TRACK_NAMES
+        }
         frame_counts = {int(track["frames"]) for track in tracks.values()}
         summary = {
             "schema_version": ARTIFACT_SCHEMA,
@@ -262,6 +296,7 @@ class CaptureArtifacts:
             "timeline_started_monotonic": timeline_started_monotonic,
             "capture": capture_status.to_dict(),
             "tracks": tracks,
+            "source_tracks": source_tracks,
             "tracks_share_timeline": len(frame_counts) == 1,
             "event_count": self.events.count,
             "metadata": metadata,

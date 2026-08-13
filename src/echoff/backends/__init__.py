@@ -7,14 +7,14 @@ from collections.abc import Callable
 
 from ..config import AecConfig
 from ..errors import UnsupportedPlatformError
-from ..models import DeviceInfo
+from ..models import AudioBlock, DeviceInfo
 from .base import CaptureSource
 
 
 def create_sources(
     config: AecConfig,
-    reference_callback: Callable[[list[float], float], None],
-    microphone_callback: Callable[[list[float], float], None],
+    reference_callback: Callable[[AudioBlock], None],
+    microphone_callback: Callable[[AudioBlock], None],
     *,
     reference_device: str | None = None,
     microphone_device: str | None = None,
@@ -25,11 +25,14 @@ def create_sources(
             "device capture is currently supported only on Windows; "
             "use WebRtcAecProcessor with application-owned PCM on this platform"
         )
-    from .windows import WasapiMicrophoneSource, WasapiReferenceSource
+    from .windows import create_windows_sources
 
-    return (
-        WasapiReferenceSource(config, reference_callback, reference_device),
-        WasapiMicrophoneSource(config, microphone_callback, microphone_device),
+    return create_windows_sources(
+        config,
+        reference_callback,
+        microphone_callback,
+        reference_device,
+        microphone_device,
     )
 
 

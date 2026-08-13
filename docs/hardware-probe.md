@@ -39,11 +39,11 @@ python -m echoff record `
   --output captures\probe-001
 ```
 
-The command records each `ffplay` process lifetime and, for playback windows
-long enough after edge trimming, writes an automatic far-end-only section to
-`analysis.json`. The edge-trim value and window kind are also stored in
-`summary.json`. These windows are reproducible but are not sample-accurate DAC
-timing.
+The command snapshots the confirmed-pair sample cursor at each `ffplay` start and
+completion. For windows long enough after edge trimming it writes an automatic
+far-end-only section to `analysis.json`. The exact sample windows, edge trim,
+and window kind are stored in `summary.json`. These are stable capture-timeline
+windows, not sample-accurate DAC timing.
 
 ## Read the result
 
@@ -54,7 +54,7 @@ timing.
 | `near_end.near_end_retained_db` | closer to 0 dB is more retained level | Only meaningful in declared near-end windows; level is not intelligibility |
 | `loopback_to_raw_energy_alignment.lag_ms` | diagnostic, not a target | Broad 10 ms energy-envelope lag estimate |
 | `normalized_correlation` | closer to `+1` means a clearer positive envelope match | Weak/ambiguous acoustic exposure can make lag unstable |
-| `summary.capture.runtime_realignments` | usually zero in stable hardware | Nonzero means a timestamp discontinuity was observed and APM was reset |
+| `summary.capture.clock_suspect_observation_count` | diagnostic | Timestamp observations that disagreed with the established sequence mapping; compare with synchronization waits and hard discontinuities |
 
 Echoff does not publish a universal pass threshold: rooms, speaker placement,
 microphone directionality, endpoint processing, and volume change the physical

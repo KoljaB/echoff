@@ -14,14 +14,20 @@ directory. Reserved files are never overwritten.
 | `computer_audio.wav` | PCM16 mono 48 kHz | Digital render reference captured from the selected output endpoint |
 | `microphone_raw.wav` | PCM16 mono 48 kHz | Physical microphone before AEC |
 | `microphone_aec.wav` | PCM16 mono 48 kHz | Microphone after WebRTC AEC |
+| `reference_received.wav` | PCM16 mono 48 kHz | Every received reference payload in source order, independent of live assignment |
+| `microphone_received.wav` | PCM16 mono 48 kHz | Every received microphone payload in source order, independent of live assignment |
 | `events.jsonl` | UTF-8 JSON Lines | Ordered lifecycle, alignment, application, and error events |
 | `config.json` | UTF-8 JSON | Effective public configuration and artifact schema |
 | `summary.json` | UTF-8 JSON | Final status, devices, counters, durations, track metadata, and hashes |
 
-The three WAVs share one sample timeline. An unmatched reference block is
-retained in `computer_audio.wav`; zeros occupy the two microphone tracks. An
-unmatched microphone block is retained in `microphone_raw.wav`; zeros occupy
-the reference and clean tracks. Events and counters explain those intervals.
+The three primary WAVs share one confirmed-pair timeline and advance only when
+both sources are present. Echoff does not create a zero-reference slot after a
+temporary stall. If the three-second reserve expires, unsafe paired output is
+suspended; raw received-source tracks continue and bounded live-buffer
+retirements are counted by cause. If capture stops in the middle of a 20 ms
+source block, the primary tracks may contain one explicitly padded final pair;
+`*_padded_samples` reports source padding. The received-source tracks contain
+only real received samples.
 
 ## Probe and CLI additions
 
@@ -39,15 +45,26 @@ Start with:
 
 - `status` and `error`;
 - selected backend/device name/index for reference and microphone;
-- `tracks_share_timeline` and each track's sample count/hash;
-- alignment lock, skew, drop, mismatch, realignment, and shutdown-tail counts;
+- `tracks_share_timeline` and each processed track's sample count/hash, plus
+  independent source-track counts and hashes;
+- alignment mode, matched counts, synchronization waits/backlog, degraded
+  retirements by cause, hard discontinuities, and shutdown-tail counts;
 - source device/silence/drop counters;
+- raw PortAudio timestamp regression/invalid/deviation counters (telemetry only);
 - AEC readiness, active far-end time, and reset count; and
 - optional application/probe metadata.
 
-Nonzero realignment is not automatically a failed run: it means Echoff detected
-a discontinuity, reset the adaptive filter once for that episode, removed stale
-heads, and resumed. Inspect the corresponding events and affected signal.
+`clock_suspect_observation_count` counts post-lock timestamp observations that
+disagree with the established mapping. In 0.1 these are diagnostics only and do
+not commit a rate correction. The `degraded_unpaired_*` totals reconcile live
+buffer retirement into explicit wait-timeout and source-failure causes; the raw
+received-source tracks preserve those payloads.
+
+`*_timestamp_regressions` and `*_invalid_timestamps` describe unreliable
+PortAudio time estimates. Echoff anchors once and then advances time from the
+received sample count, so these values do not stop capture or imply discarded
+audio. `*_timestamp_deviation_max_ms` records the largest difference between the
+reported estimate and that continuous sample timeline.
 
 ## `events.jsonl`
 
@@ -65,7 +82,8 @@ Every row contains:
 ```
 
 Core kinds include `capture_starting`, `alignment_locked`, `capture_ready`,
-`alignment_realigning`, `alignment_recovered`, `capture_failed`, and
+`synchronization_wait_started`, `synchronization_wait_ended`,
+`synchronization_degraded`, `synchronization_recovered`, `capture_failed`, and
 `capture_stopped`. Probe runs add `probe_playback_started` and
 `probe_playback_completed`. Applications may add their own low-volume kinds via
 `record_event()`.

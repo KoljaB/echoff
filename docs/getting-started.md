@@ -60,8 +60,8 @@ selectable device.
 ```
 
 Play continuous speech or music through the selected output endpoint for at
-least five seconds. The default readiness heuristic needs 3.25 seconds of
-active, correctly paired reference audio. Speak during part of the recording if
+least ten seconds. The default readiness gate needs at least 7.5 seconds of
+active, correctly paired reference audio plus stable measured suppression. Speak during part of the recording if
 you also want to inspect near-end preservation. The command prints a new
 directory under `captures\` unless `--output` is supplied. It never overwrites
 a non-empty directory.

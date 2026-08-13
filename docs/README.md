@@ -13,7 +13,7 @@ Choose the shortest path that matches what you are trying to do.
 ## Integrate
 
 - [Integration](integration.md) — choose an ownership model and handle
-  callbacks, health, shutdown, and realignment.
+  callbacks, health, shutdown, and synchronization stalls.
 - [Python API](python-api.md) — public classes, data contracts, configuration,
   buffering, and errors.
 - [Logging](logging.md) — opt-in application logging without root-logger side
@@ -29,8 +29,8 @@ Choose the shortest path that matches what you are trying to do.
 
 ## Understand the system
 
-- [Architecture](architecture.md) — why timestamps matter and how pairing,
-  WebRTC APM, and realignment interact.
+- [Architecture](architecture.md) — why timestamps matter and how startup
+  pairing, symmetric recovery, and WebRTC APM interact.
 - [Platform support](platforms.md) — built-in Windows capture and the portable
   processor boundary.
 

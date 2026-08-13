@@ -58,6 +58,12 @@ class WebRtcAecProcessor:
         self._lock = threading.Lock()
         self._apm = self._new_apm()
         self._paired_far_end_active_frames = 0
+        self._quality_frames: deque[tuple[float, float]] = deque(
+            maxlen=self.config.echo_path_quality_frames
+        )
+        self._echo_path_quality_ready = False
+        self._echo_suppression_db: float | None = None
+        self._quality_good_frames = 0
         self._alignment_epoch = 0
         self._stream_alignment_reset_count = 0
 
@@ -118,11 +124,52 @@ class WebRtcAecProcessor:
                 self._apm.process_reverse_stream(self._frame(reference_chunk))
                 microphone_frame = self._frame(microphone_chunk)
                 self._apm.process_stream(microphone_frame)
-                output.extend(self._pcm16_to_float(bytes(microphone_frame.data)))
+                clean_chunk = self._pcm16_to_float(bytes(microphone_frame.data))
+                output.extend(clean_chunk)
                 rms = math.sqrt(sum(sample * sample for sample in reference_chunk) / frame_samples)
-                if rms >= self.config.far_end_active_rms_min:
-                    self._paired_far_end_active_frames += 1
+                self._note_frame_quality(
+                    microphone_chunk,
+                    clean_chunk,
+                    reference_active=rms >= self.config.far_end_active_rms_min,
+                )
         return tuple(output)
+
+    def _note_frame_quality(
+        self,
+        microphone: Sequence[float],
+        clean: Sequence[float],
+        *,
+        reference_active: bool,
+    ) -> None:
+        if not reference_active:
+            return
+        self._paired_far_end_active_frames += 1
+        raw_energy = sum(sample * sample for sample in microphone)
+        clean_energy = sum(sample * sample for sample in clean)
+        self._quality_frames.append((raw_energy, clean_energy))
+        if len(self._quality_frames) < self.config.echo_path_quality_frames:
+            return
+        total_raw = sum(raw for raw, _clean in self._quality_frames)
+        total_clean = sum(clean for _raw, clean in self._quality_frames)
+        sample_count = len(self._quality_frames) * self.config.apm_frame_samples
+        raw_rms = math.sqrt(total_raw / sample_count)
+        floor = 1e-20
+        self._echo_suppression_db = 10.0 * math.log10(
+            max(total_raw, floor) / max(total_clean, floor)
+        )
+        active_s = self._paired_far_end_active_frames / 100.0
+        quality_good = (
+            active_s + 1e-12 >= self.config.echo_path_warmup_s
+            and raw_rms >= self.config.echo_path_quality_min_raw_rms
+            and self._echo_suppression_db >= self.config.echo_path_min_suppression_db
+        )
+        self._quality_good_frames = self._quality_good_frames + 1 if quality_good else 0
+        # Readiness describes the current rolling quality window, not a latch.
+        # The APM filter itself remains untouched when confidence falls; only
+        # playback-time consumers stop trusting insufficiently cleaned audio.
+        self._echo_path_quality_ready = (
+            self._quality_good_frames >= self.config.echo_path_quality_stable_frames
+        )
 
     def reset_alignment(self) -> None:
         """Create a fresh APM and cold echo-path epoch after realignment."""
@@ -130,6 +177,10 @@ class WebRtcAecProcessor:
         with self._lock:
             self._apm = self._new_apm()
             self._paired_far_end_active_frames = 0
+            self._quality_frames.clear()
+            self._echo_path_quality_ready = False
+            self._echo_suppression_db = None
+            self._quality_good_frames = 0
             self._alignment_epoch += 1
             self._stream_alignment_reset_count += 1
 
@@ -138,10 +189,13 @@ class WebRtcAecProcessor:
         with self._lock:
             active_s = self._paired_far_end_active_frames / 100.0
             return AecState(
-                echo_path_ready=active_s + 1e-12 >= self.config.echo_path_warmup_s,
+                echo_path_ready=self._echo_path_quality_ready,
                 far_end_active_s=active_s,
                 alignment_epoch=self._alignment_epoch,
                 stream_alignment_reset_count=self._stream_alignment_reset_count,
+                echo_path_quality_ready=self._echo_path_quality_ready,
+                echo_suppression_db=self._echo_suppression_db,
+                echo_quality_s=self._quality_good_frames / 100.0,
             )
 
 
@@ -199,8 +253,11 @@ class StreamingWebRtcAecProcessor(WebRtcAecProcessor):
                     if self._reference_activity_pending
                     else False
                 )
-                if reference_active:
-                    self._paired_far_end_active_frames += 1
+                self._note_frame_quality(
+                    chunk,
+                    self._pcm16_to_float(bytes(frame.data)),
+                    reference_active=reference_active,
+                )
         return tuple(output)
 
     def reset_alignment(self) -> None:
@@ -210,6 +267,10 @@ class StreamingWebRtcAecProcessor(WebRtcAecProcessor):
             self._microphone_pending.clear()
             self._reference_activity_pending.clear()
             self._paired_far_end_active_frames = 0
+            self._quality_frames.clear()
+            self._echo_path_quality_ready = False
+            self._echo_suppression_db = None
+            self._quality_good_frames = 0
             self._alignment_epoch += 1
             self._stream_alignment_reset_count += 1
 
@@ -239,10 +300,14 @@ class BufferedWebRtcAecProcessor(WebRtcAecProcessor):
             self._apm.process_reverse_stream(self._frame(reference))
             microphone_frame = self._frame(microphone)
             self._apm.process_stream(microphone_frame)
-            output.extend(self._pcm16_to_float(bytes(microphone_frame.data)))
+            clean = self._pcm16_to_float(bytes(microphone_frame.data))
+            output.extend(clean)
             rms = math.sqrt(sum(sample * sample for sample in reference) / frame_samples)
-            if rms >= self.config.far_end_active_rms_min:
-                self._paired_far_end_active_frames += 1
+            self._note_frame_quality(
+                microphone,
+                clean,
+                reference_active=rms >= self.config.far_end_active_rms_min,
+            )
         return tuple(output)
 
     def process_pair(
@@ -277,6 +342,10 @@ class BufferedWebRtcAecProcessor(WebRtcAecProcessor):
             self._reference_pending.clear()
             self._microphone_pending.clear()
             self._paired_far_end_active_frames = 0
+            self._quality_frames.clear()
+            self._echo_path_quality_ready = False
+            self._echo_suppression_db = None
+            self._quality_good_frames = 0
             self._alignment_epoch += 1
             self._stream_alignment_reset_count += 1
 

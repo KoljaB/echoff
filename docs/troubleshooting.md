@@ -54,10 +54,12 @@ Echoff rejects ambiguous fragments rather than guessing.
 
 ## Capture never becomes ready
 
-`start()` needs one reference and microphone block whose end timestamps fall
-within the configured tolerance. Check device errors, permissions, exclusive
-use, and `events.jsonl`. Do not increase the tolerance merely to force a lock;
-that can pair different audio intervals.
+`start()` needs initial audio from either source; it does not guarantee that an
+aligned pair already exists. Check both selected devices, permissions, exclusive
+use, source errors, and `events.jsonl`. If mic audio exists but
+`alignment_locked` is false, inspect
+reference routing and timing-invalid counters. Do not increase the tolerance
+merely to force a lock; that can pair different audio intervals.
 
 ## `computer_audio.wav` is silent or contains the wrong application
 
@@ -83,9 +85,11 @@ Check in this order:
 2. audible far-end exposure in both `computer_audio.wav` and
    `microphone_raw.wav`;
 3. `status: completed` and no source/processing error;
-4. alignment lock, skew, mismatch, realignment, silence, and drop counters;
-5. whether the current AEC epoch accumulated at least 3.25 seconds of active
-   paired reference; and
+4. alignment mode, first/mean/max skew, clock-suspect observations,
+   synchronization wait/backlog totals, degraded retirements by cause, hard
+   discontinuities, and source status counters;
+5. whether the current AEC epoch accumulated at least 7.5 seconds of active
+   paired reference and reached the configured suppression/exposure gate; and
 6. a repeatable far-end-only window rather than whole-run levels.
 
 Only then compare a predeclared `stream_delay_ms` setting under fixed hardware.
@@ -94,15 +98,19 @@ Do not compensate with ASR-text matching or a higher VAD threshold.
 ## Echo becomes strong after an endpoint or device change
 
 Create a new `AecCapture` instance. Preserve the failed run and compare selected
-device IDs, first callback skew, realignment events, and the three WAV tracks to
+device IDs, first/mean/max callback skew, runtime excursions, and the three WAV tracks to
 a known-good baseline. Hardware/driver changes can alter latency and routing
 without changing Python configuration.
 
 ## The echo path is never ready
 
 Readiness advances only on paired reference frames with RMS at least `0.001`.
-Silence is expected to remain cold. Play normal far-end audio for at least 3.25
-seconds in one alignment epoch. A realignment resets accumulated warm-up.
+After at least 7.5 seconds, the rolling one-second raw-to-clean microphone
+reduction must remain at least 10 dB for 250 ms, with raw-mic RMS at least
+`0.003`. Silence or inaudible acoustic exposure is expected to remain cold.
+Same-epoch synchronization waits and recovery do not reset readiness; degraded
+alignment still gates the public state false. An explicit processor
+`reset_alignment()` starts a cold epoch.
 
 ## The clean microphone is silent, distorted, or clipped
 

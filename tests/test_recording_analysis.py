@@ -50,7 +50,10 @@ class RecordingAndAnalysisTests(unittest.TestCase):
                     ProbeConfig(output_dir=output, **{field: math.nan})
 
     def test_probe_window_contract_is_explicitly_process_timed(self) -> None:
-        self.assertEqual(PLAYBACK_WINDOW_KIND, "ffplay_process_lifetime")
+        self.assertEqual(
+            PLAYBACK_WINDOW_KIND,
+            "ffplay_process_lifetime_on_confirmed_pair_timeline",
+        )
         self.assertEqual(ANALYSIS_EDGE_TRIM_S, 0.25)
 
     def test_artifacts_are_exclusive_and_analysis_measures_declared_windows(self) -> None:
@@ -80,7 +83,7 @@ class RecordingAndAnalysisTests(unittest.TestCase):
             self.assertTrue((output / "analysis.json").is_file())
             with self.assertRaises(FileExistsError):
                 analyze_capture(output)
-            with self.assertRaisesRegex(ValueError, "outside the shared microphone timeline"):
+            with self.assertRaisesRegex(ValueError, "outside the shared processed timeline"):
                 analyze_capture(
                     output,
                     far_end_windows=[(0.0, 999.0)],
@@ -103,19 +106,21 @@ class RecordingAndAnalysisTests(unittest.TestCase):
                 places=1,
             )
             summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["schema_version"], "echoff-capture-artifacts-v2")
             self.assertTrue(summary["tracks_share_timeline"])
             with self.assertRaises(FileExistsError):
                 CaptureArtifacts(output, AecConfig())
 
-    def test_unmatched_blocks_keep_three_tracks_on_one_timeline(self) -> None:
+    def test_raw_reference_does_not_advance_the_confirmed_pair_timeline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "capture"
             artifacts = CaptureArtifacts(output, AecConfig())
-            artifacts.write_unmatched_reference([0.2] * 960)
-            artifacts.write_unmatched_microphone([0.1] * 960)
-            self.assertEqual(artifacts.computer_audio.sample_count, 1_920)
-            self.assertEqual(artifacts.microphone_raw.sample_count, 1_920)
-            self.assertEqual(artifacts.microphone_aec.sample_count, 1_920)
+            artifacts.write_reference_received([0.2] * 960)
+            artifacts.write_pair([0.0] * 960, [0.1] * 960, [0.05] * 960)
+            self.assertEqual(artifacts.reference_received.sample_count, 960)
+            self.assertEqual(artifacts.computer_audio.sample_count, 960)
+            self.assertEqual(artifacts.microphone_raw.sample_count, 960)
+            self.assertEqual(artifacts.microphone_aec.sample_count, 960)
             artifacts.close_tracks()
             artifacts.events.close()
 

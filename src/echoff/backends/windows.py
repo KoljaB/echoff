@@ -3,18 +3,33 @@
 from __future__ import annotations
 
 import logging
+import math
 import queue
 import threading
 import time
 from array import array
 from collections.abc import Callable
+from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
+from ..clock import FixedBlockSampleClock
 from ..config import AecConfig
 from ..errors import AudioBackendError
-from ..models import DeviceInfo
+from ..models import AudioBlock, DeviceInfo
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _RawCallbackPacket:
+    """One PortAudio callback payload awaiting non-realtime decoding."""
+
+    payload: bytes | None
+    frame_count: int
+    time_info: dict[str, float]
+    status_flags: int
+    callback_monotonic: float
 
 
 def _load_pyaudio() -> Any:
@@ -74,25 +89,190 @@ def list_windows_devices() -> list[DeviceInfo]:
         audio.terminate()
 
 
+class _SharedWasapiContext:
+    """Serialize every PortAudio host operation on one control thread."""
+
+    def __init__(self, users: int) -> None:
+        self.pyaudio: Any | None = None
+        self.audio: Any | None = None
+        self._remaining_users = users
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._startup_error: BaseException | None = None
+        self._calls: queue.Queue[
+            tuple[
+                Callable[[], Any],
+                threading.Event,
+                list[Any],
+                list[BaseException],
+            ]
+            | None
+        ] = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="echoff-wasapi-control",
+            daemon=True,
+        )
+        self._thread.start()
+        if not self._ready.wait(3.0):
+            raise AudioBackendError("PortAudio control thread did not become ready")
+        if self._startup_error is not None:
+            raise AudioBackendError(
+                f"PortAudio initialization failed: {self._startup_error}"
+            ) from self._startup_error
+
+    @classmethod
+    def create(cls, users: int) -> _SharedWasapiContext:
+        return cls(users)
+
+    def _run(self) -> None:
+        try:
+            self.pyaudio = _load_pyaudio()
+            self.audio = self.pyaudio.PyAudio()
+        except BaseException as exc:
+            self._startup_error = exc
+            self._ready.set()
+            return
+        self._ready.set()
+        try:
+            while True:
+                item = self._calls.get()
+                if item is None:
+                    return
+                function, finished, results, errors = item
+                try:
+                    results.append(function())
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    finished.set()
+        finally:
+            assert self.audio is not None
+            self.audio.terminate()
+
+    def call(self, function: Callable[[], Any]) -> Any:
+        if self._startup_error is not None:
+            raise self._startup_error
+        finished = threading.Event()
+        results: list[Any] = []
+        errors: list[BaseException] = []
+        self._calls.put((function, finished, results, errors))
+        if not finished.wait(3.0):
+            raise AudioBackendError("PortAudio control operation timed out")
+        if errors:
+            raise errors[0]
+        return results[0] if results else None
+
+    def reinitialize(self) -> Any:
+        """Replace the inactive PortAudio manager on the control thread once."""
+
+        def replace() -> Any:
+            old_audio = self.audio
+            if old_audio is None or self.pyaudio is None:
+                raise AudioBackendError("PortAudio context is not initialized")
+            old_audio.terminate()
+            self.audio = self.pyaudio.PyAudio()
+            return self.audio
+
+        return self.call(replace)
+
+    def release(self) -> None:
+        should_stop = False
+        with self._lock:
+            if self._remaining_users <= 0:
+                return
+            self._remaining_users -= 1
+            if self._remaining_users == 0:
+                should_stop = True
+        if should_stop:
+            self._calls.put(None)
+            self._thread.join(timeout=3.0)
+
+
 class _ThreadedSource:
+    callback: Callable[[AudioBlock], None]
+    config: AecConfig
+
     backend_name = "unknown"
     source_label = "audio"
 
     def __init__(self) -> None:
         self.stop_event = threading.Event()
         self.ready_event = threading.Event()
+        self.activate_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.error: Exception | None = None
         self.device_block_count = 0
         self.synthetic_silence_block_count = 0
         self.dropped_device_block_count = 0
+        self.timestamp_regression_count = 0
+        self.invalid_timestamp_count = 0
+        self.timestamp_deviation_max_s = 0.0
         self.selected_device_name: str | None = None
         self.selected_device_index: int | None = None
+        self._timeline_anchor_end: float | None = None
+        self._timeline_last_end: float | None = None
+        self._reported_prediction_end: float | None = None
+        self._last_reported_end: float | None = None
+        self.timestamp_gap_block_count = 0
+        self.timestamp_anomaly_count = 0
+        self.callback_status_count = 0
+        self.input_overflow_count = 0
+        self.input_underflow_count = 0
+        self.padded_sample_count = 0
+        self._sample_clock: FixedBlockSampleClock | None = None
+        self.callback_packet_count = 0
+        self.callback_payload_frame_count = 0
+        self.callback_queue_high_watermark = 0
+        self.callback_queue_age_max_s = 0.0
+        self.callback_enqueue_max_s = 0.0
+        self.callback_timeline_drift_s = 0.0
+        self.callback_timeline_drift_max_s = 0.0
+        self._first_callback_monotonic: float | None = None
+        self._first_callback_frame_count = 0
+        self._callback_queue: queue.Queue[_RawCallbackPacket | None] = queue.Queue()
+        self._callback_decoder: threading.Thread | None = None
+        self._callback_decoder_error: Exception | None = None
+        self._decoded_callback_packet_count = 0
+
+    def _configure_sample_clock(self, config: AecConfig) -> None:
+        self._sample_clock = FixedBlockSampleClock(
+            sample_rate=config.sample_rate,
+            block_samples=config.block_samples,
+        )
+
+    def _sync_clock_counters(self) -> None:
+        if self._sample_clock is None:
+            return
+        self.timestamp_regression_count = self._sample_clock.timestamp_regression_count
+        self.invalid_timestamp_count = self._sample_clock.invalid_timestamp_count
+        self.timestamp_deviation_max_s = self._sample_clock.timestamp_deviation_max_s
+        self.timestamp_anomaly_count = self._sample_clock.timestamp_anomaly_count
+        self.padded_sample_count = self._sample_clock.padded_sample_count
+        # Timestamps are observations only. They never imply missing blocks.
+        self.timestamp_gap_block_count = 0
+
+    def _note_status(self, status_flags: int, pyaudio: Any | None = None) -> bool:
+        flags = int(status_flags)
+        if not flags:
+            return False
+        self.callback_status_count += 1
+        input_underflow = int(getattr(pyaudio, "paInputUnderflow", 0x01))
+        input_overflow = int(getattr(pyaudio, "paInputOverflow", 0x02))
+        discontinuity = False
+        if flags & input_underflow:
+            self.input_underflow_count += 1
+            discontinuity = True
+        if flags & input_overflow:
+            self.input_overflow_count += 1
+            discontinuity = True
+        return discontinuity
 
     def start(self) -> None:
         if self.thread is not None:
             raise RuntimeError(f"{self.source_label} source already started")
         self.stop_event.clear()
+        self.activate_event.clear()
         self.thread = threading.Thread(
             target=self._run_guarded,
             name=f"echoff-{self.source_label}",
@@ -108,8 +288,17 @@ class _ThreadedSource:
 
     def stop(self) -> None:
         self.stop_event.set()
+        self.activate_event.set()
         if self.thread is not None:
-            self.thread.join(timeout=3.0)
+            # The source thread first stops its native stream and then drains
+            # every callback packet through the decoder. A bounded join here
+            # would silently abandon queued device payloads during shutdown.
+            self.thread.join()
+
+    def activate(self) -> None:
+        if self.thread is None or not self.ready_event.is_set():
+            raise RuntimeError(f"{self.source_label} source is not prepared")
+        self.activate_event.set()
 
     def _run_guarded(self) -> None:
         try:
@@ -123,27 +312,148 @@ class _ThreadedSource:
     def _run(self) -> None:
         raise NotImplementedError
 
-    def _take_device_block(
-        self,
-        device_queue: queue.Queue[bytes],
-        *,
-        timeout_s: float,
-        discard_surplus: bool,
-    ) -> bytes | None:
-        """Wait briefly for one device block and optionally collapse stale surplus."""
+    def _wait_for_activation(self) -> bool:
+        while not self.stop_event.is_set():
+            if self.activate_event.wait(0.05):
+                return not self.stop_event.is_set()
+        return False
 
+    def _enqueue_callback_packet(
+        self,
+        payload: bytes | None,
+        frame_count: int,
+        time_info: dict[str, float],
+        status_flags: int,
+    ) -> None:
+        """Perform the constant-time portion of a PortAudio callback."""
+
+        started = time.perf_counter()
+        callback_monotonic = time.monotonic()
+        # PortAudio owns the small time-info mapping. Preserve the two values
+        # needed by the decoder rather than retaining backend-owned state.
+        observed_time = {
+            "input_buffer_adc_time": time_info.get("input_buffer_adc_time", float("nan")),
+            "current_time": time_info.get("current_time", float("nan")),
+        }
+        packet = _RawCallbackPacket(
+            payload=payload,
+            frame_count=int(frame_count),
+            time_info=observed_time,
+            status_flags=int(status_flags),
+            callback_monotonic=callback_monotonic,
+        )
+        self._callback_queue.put_nowait(packet)
+        self.callback_packet_count += 1
+        self.callback_payload_frame_count += max(0, int(frame_count))
+        depth = max(1, self._callback_queue.qsize())
+        self.callback_queue_high_watermark = max(
+            self.callback_queue_high_watermark,
+            depth,
+        )
+        if self._first_callback_monotonic is None:
+            self._first_callback_monotonic = callback_monotonic
+            self._first_callback_frame_count = max(0, int(frame_count))
+        else:
+            payload_after_first = (
+                self.callback_payload_frame_count - self._first_callback_frame_count
+            )
+            drift = (
+                callback_monotonic
+                - self._first_callback_monotonic
+                - payload_after_first / self.config.sample_rate
+            )
+            self.callback_timeline_drift_s = drift
+            self.callback_timeline_drift_max_s = max(
+                self.callback_timeline_drift_max_s,
+                abs(drift),
+            )
+        self.callback_enqueue_max_s = max(
+            self.callback_enqueue_max_s,
+            time.perf_counter() - started,
+        )
+
+    def _start_callback_decoder(
+        self,
+        decode: Callable[[_RawCallbackPacket], None],
+    ) -> None:
+        if self._callback_decoder is not None:
+            raise RuntimeError(f"{self.source_label} callback decoder already started")
+
+        def run() -> None:
+            try:
+                while True:
+                    packet = self._callback_queue.get()
+                    if packet is None:
+                        return
+                    self.callback_queue_age_max_s = max(
+                        self.callback_queue_age_max_s,
+                        time.monotonic() - packet.callback_monotonic,
+                    )
+                    decode(packet)
+                    self._decoded_callback_packet_count += 1
+            except Exception as exc:
+                self._callback_decoder_error = exc
+                self.stop_event.set()
+
+        self._callback_decoder = threading.Thread(
+            target=run,
+            name=f"echoff-{self.source_label}-decoder",
+            daemon=True,
+        )
+        self._callback_decoder.start()
+
+    def _stop_callback_decoder(self) -> None:
+        decoder = self._callback_decoder
+        if decoder is None:
+            return
+        self._callback_queue.put_nowait(None)
+        decoder.join()
+        self._callback_decoder = None
+
+    def _decoder_has_pending_packets(self) -> bool:
+        return self._decoded_callback_packet_count < self.callback_packet_count
+
+    def _raise_callback_decoder_error(self) -> None:
+        if self._callback_decoder_error is not None:
+            raise self._callback_decoder_error
+
+    def _emit_samples(
+        self,
+        samples: list[float],
+        *,
+        callback_monotonic: float,
+        time_info: dict[str, float],
+        status_flags: int,
+        discontinuity: bool,
+    ) -> None:
+        if self._sample_clock is None:  # pragma: no cover - configured by subclasses
+            raise RuntimeError("sample clock is not configured")
         try:
-            payload = device_queue.get(timeout=max(0.0, timeout_s))
-        except queue.Empty:
-            return None
-        if discard_surplus:
-            while device_queue.qsize() > 1:
-                try:
-                    payload = device_queue.get_nowait()
-                except queue.Empty:
-                    break
-                self.dropped_device_block_count += 1
-        return payload
+            adc_start = float(time_info["input_buffer_adc_time"])
+            current_time = float(time_info["current_time"])
+        except (KeyError, TypeError, ValueError):
+            adc_start = None
+            current_time = None
+        blocks = self._sample_clock.push(
+            samples,
+            callback_monotonic=callback_monotonic,
+            adc_start=adc_start,
+            current_time=current_time,
+            status_flags=status_flags,
+            discontinuity=discontinuity,
+        )
+        self._sync_clock_counters()
+        for block in blocks:
+            self.callback(block)
+            self.device_block_count += 1
+
+    def _flush_sample_clock(self) -> None:
+        if self._sample_clock is None:
+            return
+        for block in self._sample_clock.flush(callback_monotonic=time.monotonic()):
+            self.callback(block)
+            self.device_block_count += 1
+        self._sync_clock_counters()
 
 
 class WasapiReferenceSource(_ThreadedSource):
@@ -155,13 +465,17 @@ class WasapiReferenceSource(_ThreadedSource):
     def __init__(
         self,
         config: AecConfig,
-        callback: Callable[[list[float], float], None],
+        callback: Callable[[AudioBlock], None],
         device: str | None = None,
+        *,
+        _context: _SharedWasapiContext | None = None,
     ) -> None:
         super().__init__()
         self.config = config
+        self._configure_sample_clock(config)
         self.callback = callback
         self.device = device
+        self._context = _context
 
     def _select_device(self, audio: Any) -> dict[str, Any]:
         if self.device is None:
@@ -191,107 +505,127 @@ class WasapiReferenceSource(_ThreadedSource):
         return matches[0]
 
     def _run(self) -> None:
-        pyaudio = _load_pyaudio()
-        audio = pyaudio.PyAudio()
+        context = self._context or _SharedWasapiContext.create(1)
+        self._context = context
+        pyaudio = context.pyaudio
+        audio = context.audio
+        if pyaudio is None or audio is None:  # pragma: no cover - guarded by context startup
+            raise AudioBackendError("PortAudio context is not initialized")
         stream = None
-        reader: threading.Thread | None = None
+        callback_errors: list[Exception] = []
         try:
-            info = self._select_device(audio)
+            info = context.call(lambda: self._select_device(audio))
             self.selected_device_name = str(info.get("name") or "") or None
             self.selected_device_index = int(info["index"])
             channels = max(1, int(info.get("maxInputChannels") or 1))
             block_frames = self.config.block_samples
-            stream = audio.open(
-                format=pyaudio.paInt16,
-                channels=channels,
-                rate=self.config.sample_rate,
-                input=True,
-                input_device_index=self.selected_device_index,
-                frames_per_buffer=block_frames,
-            )
-            device_queue: queue.Queue[bytes] = queue.Queue()
-            reader_error: list[Exception] = []
+            callback_frames = block_frames * 5
 
-            def read_device() -> None:
+            def decode(packet: _RawCallbackPacket) -> None:
+                discontinuity = self._note_status(packet.status_flags, pyaudio)
+                if packet.payload is None:
+                    pcm = array("h", [0] * max(0, packet.frame_count * channels))
+                    self.synthetic_silence_block_count += max(
+                        1, math.ceil(max(0, packet.frame_count) / block_frames)
+                    )
+                    discontinuity = True
+                else:
+                    pcm = array("h")
+                    pcm.frombytes(packet.payload)
+                if len(pcm) % channels:
+                    raise AudioBackendError(
+                        "reference callback payload does not contain whole channel frames"
+                    )
+                actual_frames = len(pcm) // channels
+                if actual_frames <= 0:
+                    return
+                scale = 1.0 / 32768.0
+                if channels == 1:
+                    samples = [value * scale for value in pcm]
+                else:
+                    samples = [
+                        sum(pcm[index : index + channels]) * scale / channels
+                        for index in range(0, len(pcm), channels)
+                    ]
+                self._emit_samples(
+                    samples,
+                    callback_monotonic=packet.callback_monotonic,
+                    time_info=packet.time_info,
+                    status_flags=packet.status_flags,
+                    discontinuity=discontinuity,
+                )
+
+            self._start_callback_decoder(decode)
+
+            def on_audio(
+                payload: bytes | None,
+                frame_count: int,
+                time_info: dict[str, float],
+                status_flags: int,
+            ) -> tuple[None, int]:
                 try:
-                    while not self.stop_event.is_set():
-                        device_queue.put(stream.read(block_frames, exception_on_overflow=False))
+                    self._enqueue_callback_packet(
+                        payload,
+                        frame_count,
+                        time_info,
+                        status_flags,
+                    )
+                    return (
+                        None,
+                        pyaudio.paComplete if self.stop_event.is_set() else pyaudio.paContinue,
+                    )
                 except Exception as exc:
-                    if not self.stop_event.is_set():
-                        reader_error.append(exc)
+                    callback_errors.append(exc)
+                    self.stop_event.set()
+                    return None, pyaudio.paAbort
 
-            reader = threading.Thread(
-                target=read_device,
-                name="echoff-reference-reader",
-                daemon=True,
+            stream = context.call(
+                lambda: audio.open(
+                    format=pyaudio.paInt16,
+                    channels=channels,
+                    rate=self.config.sample_rate,
+                    input=True,
+                    input_device_index=self.selected_device_index,
+                    frames_per_buffer=callback_frames,
+                    start=False,
+                    stream_callback=on_audio,
+                )
             )
-            reader.start()
             self.ready_event.set()
             LOGGER.info(
-                "reference device ready: %s (index %s)",
+                "reference device prepared: %s (index %s)",
                 self.selected_device_name,
                 self.selected_device_index,
             )
-            scale = 1.0 / 32768.0
-            next_tick = time.monotonic() + self.config.block_duration_s
-            silence = [0.0] * block_frames
-            reference_state = "unknown"
-            while not self.stop_event.is_set():
-                if self.stop_event.wait(max(0.0, next_tick - time.monotonic())):
-                    break
-                if reader_error:
-                    raise reader_error[0]
-                wait_budget_s = (
-                    self.config.reference_stall_grace_s
-                    if reference_state != "idle"
-                    else min(0.018, self.config.block_duration_s * 0.9)
-                )
-                payload = self._take_device_block(
-                    device_queue,
-                    timeout_s=max(0.0, next_tick + wait_budget_s - time.monotonic()),
-                    discard_surplus=False,
-                )
-                if reader_error:
-                    raise reader_error[0]
-                if payload is not None:
-                    pcm = array("h")
-                    pcm.frombytes(payload)
-                    if channels == 1:
-                        samples = [value * scale for value in pcm]
-                    else:
-                        samples = [
-                            sum(pcm[index : index + channels]) * scale / channels
-                            for index in range(0, len(pcm) - channels + 1, channels)
-                        ]
-                    self.device_block_count += 1
-                    reference_state = "active"
-                    self.callback(samples, next_tick)
-                    next_tick += self.config.block_duration_s
-                    continue
-
-                # A blocking loopback read may complete slightly after its nominal
-                # scheduler tick. While the endpoint is active (or its state is not
-                # known yet), preserve that tick for a bounded grace period instead
-                # of inserting silence and relabelling the real block as the next
-                # tick. Once the grace expires, classify the endpoint as idle and
-                # catch the synthetic clock up in one bounded burst. Idle ticks use
-                # only the short normal read margin, so microphone delivery does not
-                # inherit the full stall grace while the endpoint is silent.
-                reference_state = "idle"
-                now = time.monotonic()
-                while next_tick <= now + 1e-9 and not self.stop_event.is_set():
-                    self.synthetic_silence_block_count += 1
-                    self.callback(silence, next_tick)
-                    next_tick += self.config.block_duration_s
+            if not self._wait_for_activation():
+                return
+            context.call(stream.start_stream)
+            while not self.stop_event.wait(0.05):
+                if callback_errors:
+                    raise callback_errors[0]
+                self._raise_callback_decoder_error()
+                if (
+                    not context.call(stream.is_active)
+                    and not self._decoder_has_pending_packets()
+                ):
+                    raise AudioBackendError("reference PortAudio callback stream stopped")
+            if callback_errors:
+                raise callback_errors[0]
+            self._raise_callback_decoder_error()
         finally:
             if stream is not None:
                 try:
-                    stream.stop_stream()
+                    context.call(stream.stop_stream)
                 finally:
-                    if reader is not None:
-                        reader.join(timeout=1.0)
-                    stream.close()
-            audio.terminate()
+                    try:
+                        self._stop_callback_decoder()
+                    finally:
+                        context.call(stream.close)
+            else:
+                self._stop_callback_decoder()
+            self._flush_sample_clock()
+            context.release()
+        self._raise_callback_decoder_error()
 
 
 class WasapiMicrophoneSource(_ThreadedSource):
@@ -303,13 +637,17 @@ class WasapiMicrophoneSource(_ThreadedSource):
     def __init__(
         self,
         config: AecConfig,
-        callback: Callable[[list[float], float], None],
+        callback: Callable[[AudioBlock], None],
         device: str | None = None,
+        *,
+        _context: _SharedWasapiContext | None = None,
     ) -> None:
         super().__init__()
         self.config = config
+        self._configure_sample_clock(config)
         self.callback = callback
         self.device = device
+        self._context = _context
 
     def _select_device(self, audio: Any, pyaudio: Any) -> dict[str, Any]:
         if self.device is None:
@@ -399,75 +737,146 @@ class WasapiMicrophoneSource(_ThreadedSource):
         self.selected_device_name = str(info.get("name") or "") or None
         self.selected_device_index = device_index
         callback_error: list[Exception] = []
-        sample_clock_end: float | None = None
-
-        def on_audio(indata: Any, frames: int, _time_info: Any, status: Any) -> None:
-            nonlocal sample_clock_end
+        def on_audio(indata: Any, frames: int, time_info: Any, status: Any) -> None:
+            callback_monotonic = time.monotonic()
             try:
-                if status:
-                    self.dropped_device_block_count += 1
+                flags = 0
+                if bool(getattr(status, "input_underflow", False)):
+                    flags |= 0x01
+                if bool(getattr(status, "input_overflow", False)):
+                    flags |= 0x02
+                if status and not flags:
+                    flags = 0x20
+                discontinuity = self._note_status(flags)
                 samples = indata.reshape(-1).tolist()
-                sample_clock_end = (
-                    time.monotonic()
-                    if sample_clock_end is None
-                    else sample_clock_end + frames / self.config.sample_rate
+                self._emit_samples(
+                    samples,
+                    callback_monotonic=callback_monotonic,
+                    time_info={
+                        "input_buffer_adc_time": float(time_info.inputBufferAdcTime),
+                        "current_time": float(time_info.currentTime),
+                    },
+                    status_flags=flags,
+                    discontinuity=discontinuity,
                 )
-                self.device_block_count += 1
-                self.callback(samples, sample_clock_end)
             except Exception as exc:
                 callback_error.append(exc)
                 raise sounddevice.CallbackAbort from exc
 
-        with sounddevice.InputStream(
+        stream = sounddevice.InputStream(
             device=device_index,
             channels=1,
             samplerate=self.config.sample_rate,
             dtype="float32",
             blocksize=block_frames,
             callback=on_audio,
-        ):
+        )
+        try:
             self.ready_event.set()
             LOGGER.info(
-                "microphone fallback ready: %s (index %s)",
+                "microphone fallback prepared: %s (index %s)",
                 self.selected_device_name,
                 self.selected_device_index,
             )
+            if not self._wait_for_activation():
+                return
+            stream.start()
             while not self.stop_event.wait(0.05):
                 if callback_error:
                     raise callback_error[0]
+        finally:
+            stream.stop()
+            stream.close()
+            self._flush_sample_clock()
 
     def _run(self) -> None:
-        pyaudio = _load_pyaudio()
-        audio = pyaudio.PyAudio()
+        context = self._context or _SharedWasapiContext.create(1)
+        self._context = context
+        pyaudio = context.pyaudio
+        audio = context.audio
+        if pyaudio is None or audio is None:  # pragma: no cover - guarded by context startup
+            raise AudioBackendError("PortAudio context is not initialized")
         stream = None
-        reader: threading.Thread | None = None
+        callback_errors: list[Exception] = []
         try:
             block_frames = self.config.block_samples
-            device_queue: queue.Queue[bytes] = queue.Queue()
-            reader_error: list[Exception] = []
+            callback_frames = block_frames * 5
             info: dict[str, Any] | None = None
             last_open_error: OSError | None = None
-            for attempt in range(3):
-                info = self._select_device(audio, pyaudio)
+
+            def decode(packet: _RawCallbackPacket) -> None:
+                discontinuity = self._note_status(packet.status_flags, pyaudio)
+                if packet.payload is None:
+                    pcm = array("h", [0] * max(0, packet.frame_count))
+                    self.synthetic_silence_block_count += max(
+                        1, math.ceil(max(0, packet.frame_count) / block_frames)
+                    )
+                    discontinuity = True
+                else:
+                    pcm = array("h")
+                    pcm.frombytes(packet.payload)
+                if not pcm:
+                    return
+                self._emit_samples(
+                    [value / 32768.0 for value in pcm],
+                    callback_monotonic=packet.callback_monotonic,
+                    time_info=packet.time_info,
+                    status_flags=packet.status_flags,
+                    discontinuity=discontinuity,
+                )
+
+            self._start_callback_decoder(decode)
+
+            def on_audio(
+                payload: bytes | None,
+                frame_count: int,
+                time_info: dict[str, float],
+                status_flags: int,
+            ) -> tuple[None, int]:
                 try:
-                    stream = audio.open(
-                        format=pyaudio.paInt16,
-                        channels=1,
-                        rate=self.config.sample_rate,
-                        input=True,
-                        input_device_index=int(info["index"]),
-                        frames_per_buffer=block_frames,
+                    self._enqueue_callback_packet(
+                        payload,
+                        frame_count,
+                        time_info,
+                        status_flags,
+                    )
+                    return (
+                        None,
+                        pyaudio.paComplete if self.stop_event.is_set() else pyaudio.paContinue,
+                    )
+                except Exception as exc:
+                    callback_errors.append(exc)
+                    self.stop_event.set()
+                    return None, pyaudio.paAbort
+
+            for attempt in range(2):
+                info = context.call(partial(self._select_device, audio, pyaudio))
+                try:
+                    selected_index = int(info["index"])
+                    stream = context.call(
+                        partial(
+                            audio.open,
+                            format=pyaudio.paInt16,
+                            channels=1,
+                            rate=self.config.sample_rate,
+                            input=True,
+                            input_device_index=selected_index,
+                            frames_per_buffer=callback_frames,
+                            start=False,
+                            stream_callback=on_audio,
+                        )
                     )
                     break
                 except OSError as exc:
                     last_open_error = exc
-                    if attempt < 2:
-                        time.sleep(0.15)
+                    if attempt == 0:
+                        audio = context.reinitialize()
             if stream is None:
                 device_name = "unknown" if info is None else str(info.get("name", "unknown"))
                 if not self.config.allow_wdmks_microphone_fallback:
                     raise AudioBackendError(
-                        f"failed to open WASAPI microphone {device_name!r}: {last_open_error}"
+                        f"failed to open WASAPI microphone {device_name!r} after one "
+                        f"fresh-context retry: {last_open_error}"
                     )
                 try:
                     self._run_wdmks_fallback(
@@ -477,62 +886,70 @@ class WasapiMicrophoneSource(_ThreadedSource):
                     return
                 except Exception as fallback_error:
                     raise AudioBackendError(
-                        f"failed to open WASAPI microphone {device_name!r} after 3 attempts: "
+                        f"failed to open WASAPI microphone {device_name!r} after one "
+                        "fresh-context retry: "
                         f"{last_open_error}; WDM-KS fallback failed: {fallback_error}"
                     ) from fallback_error
             if info is None:
                 raise AudioBackendError("microphone device metadata is unavailable")
             self.selected_device_name = str(info.get("name") or "") or None
             self.selected_device_index = int(info["index"])
-
-            def read_device() -> None:
-                try:
-                    while not self.stop_event.is_set():
-                        device_queue.put(stream.read(block_frames, exception_on_overflow=False))
-                except Exception as exc:
-                    if not self.stop_event.is_set():
-                        reader_error.append(exc)
-
-            reader = threading.Thread(
-                target=read_device,
-                name="echoff-microphone-reader",
-                daemon=True,
-            )
-            reader.start()
             self.ready_event.set()
             LOGGER.info(
-                "microphone device ready: %s (index %s)",
+                "microphone device prepared: %s (index %s)",
                 self.selected_device_name,
                 self.selected_device_index,
             )
-            next_tick = time.monotonic()
-            silence = [0.0] * block_frames
-            while not self.stop_event.is_set():
-                next_tick += self.config.block_duration_s
-                if self.stop_event.wait(max(0.0, next_tick - time.monotonic())):
-                    break
-                if reader_error:
-                    raise reader_error[0]
-                payload = self._take_device_block(
-                    device_queue,
-                    timeout_s=min(0.018, self.config.block_duration_s * 0.9),
-                    discard_surplus=(time.monotonic() - next_tick < self.config.block_duration_s),
-                )
-                if payload is not None:
-                    pcm = array("h")
-                    pcm.frombytes(payload)
-                    samples = [value / 32768.0 for value in pcm]
-                    self.device_block_count += 1
-                else:
-                    samples = silence
-                    self.synthetic_silence_block_count += 1
-                self.callback(samples, next_tick)
+            if not self._wait_for_activation():
+                return
+            context.call(stream.start_stream)
+            while not self.stop_event.wait(0.05):
+                if callback_errors:
+                    raise callback_errors[0]
+                self._raise_callback_decoder_error()
+                if (
+                    not context.call(stream.is_active)
+                    and not self._decoder_has_pending_packets()
+                ):
+                    raise AudioBackendError("microphone PortAudio callback stream stopped")
+            if callback_errors:
+                raise callback_errors[0]
+            self._raise_callback_decoder_error()
         finally:
             if stream is not None:
                 try:
-                    stream.stop_stream()
+                    context.call(stream.stop_stream)
                 finally:
-                    if reader is not None:
-                        reader.join(timeout=1.0)
-                    stream.close()
-            audio.terminate()
+                    try:
+                        self._stop_callback_decoder()
+                    finally:
+                        context.call(stream.close)
+            else:
+                self._stop_callback_decoder()
+            self._flush_sample_clock()
+            context.release()
+        self._raise_callback_decoder_error()
+
+
+def create_windows_sources(
+    config: AecConfig,
+    reference_callback: Callable[[AudioBlock], None],
+    microphone_callback: Callable[[AudioBlock], None],
+    reference_device: str | None,
+    microphone_device: str | None,
+) -> tuple[WasapiReferenceSource, WasapiMicrophoneSource]:
+    context = _SharedWasapiContext.create(2)
+    return (
+        WasapiReferenceSource(
+            config,
+            reference_callback,
+            reference_device,
+            _context=context,
+        ),
+        WasapiMicrophoneSource(
+            config,
+            microphone_callback,
+            microphone_device,
+            _context=context,
+        ),
+    )

@@ -29,12 +29,16 @@ capture emits 20 ms blocks (960 samples) by default.
 | `noise_suppression` | `False` | Enable WebRTC noise suppression in addition to AEC |
 | `high_pass_filter` | `True` | Enable WebRTC high-pass filtering |
 | `automatic_gain_control` | `False` | Enable WebRTC AGC; off by default to avoid changing level policy silently |
-| `pair_tolerance_s` | `0.010` | Maximum timestamp difference for a pair; no more than half a capture block |
-| `reference_stall_grace_s` | `0.100` | Maximum time an active/unknown loopback tick is held for a late real block before the endpoint is classified idle; at least one block and no more than `startup_timeout_s` |
+| `pair_tolerance_s` | `0.010` | Tolerance for startup/recovery timing evidence; no more than half a capture block |
+| `reference_stall_grace_s` | `3.0` | Symmetric exceptional reserve for either temporarily late source; starts when the worker first observes an unmatched head |
 | `queue_fatal_s` | `15.0` | Backlog duration that becomes a fatal health error |
 | `startup_timeout_s` | `3.0` | Maximum wait for the first aligned pair |
-| `echo_path_warmup_s` | `3.25` | Required paired active far-end time before readiness |
+| `echo_path_warmup_s` | `7.5` | Minimum paired active far-end time before readiness |
 | `far_end_active_rms_min` | `0.001` | Per-frame reference RMS threshold for warm-up |
+| `echo_path_quality_window_s` | `1.0` | Rolling raw/clean microphone energy window |
+| `echo_path_quality_stable_s` | `0.25` | Required consecutive quality-qualified time |
+| `echo_path_min_suppression_db` | `10.0` | Minimum measured raw-to-clean reduction |
+| `echo_path_quality_min_raw_rms` | `0.003` | Minimum raw-mic exposure for a meaningful quality decision |
 | `backend` | `"auto"` | `"auto"` or `"windows"`; built-in capture still requires Windows |
 | `allow_wdmks_microphone_fallback` | `True` | Try a matched (or sole) WDM-KS mic if WASAPI cannot open |
 
@@ -52,8 +56,15 @@ AecCapture(
     output_dir=None,
     reference_device=None,
     microphone_device=None,
+    console_diagnostics=True,
 )
 ```
+
+`console_diagnostics=True` prints important runtime warnings and errors directly
+to `stderr`, in red when the stream is an interactive terminal. This is enabled
+by default so a lost reference mapping or capture failure is visible even when
+the host application has not configured Python logging. Set it to `False` only
+when the host fully surfaces `on_event` itself.
 
 The two injectable constructor hooks used by tests (`processor` and
 `source_factory`) are not needed for normal application integration.
@@ -61,8 +72,9 @@ The two injectable constructor hooks used by tests (`processor` and
 ### Callbacks
 
 - `on_frame(AecFrame)`: each aligned, processed pair.
-- `on_reference(samples, ended_monotonic)`: every captured reference block,
-  including blocks dropped from AEC pairing during realignment.
+- `on_reference(samples, ended_monotonic)`: the reference for each confirmed
+  pair emitted on the processed timeline. Use `reference_received.wav` for every
+  raw reference payload, including unpaired boundaries.
 - `on_event(CaptureEvent)`: structured lifecycle and alignment events.
 
 `on_frame` and `on_reference` run on the pairing thread and must return quickly.
@@ -73,11 +85,12 @@ down audio processing.
 
 ### Lifecycle and methods
 
-- `start() -> AecCapture`: single-use startup; waits for an aligned pair.
+- `start() -> AecCapture`: single-use startup; waits for initial source audio,
+  not necessarily an aligned pair.
 - `stop(error=None, status_name=None)`: idempotent cleanup and finalization.
 - `status() -> CaptureStatus`: immutable current snapshot.
-- `raise_if_failed()`: raises on source, worker, callback, or fatal backlog
-  failure.
+- `raise_if_failed()`: records source failures as degraded status/events and
+  raises on processing/callback failure or an unsafe fatal backlog.
 - `record_event(kind, **details)`: append an application event to the capture
   timeline while artifacts are open; outside that lifetime only `on_event` can
   observe it.
@@ -86,9 +99,13 @@ down audio processing.
 - `started_monotonic` and `elapsed_s()` expose lifecycle timing.
   `timeline_started_monotonic` is set after the first artifact block only when
   `output_dir` recording is enabled.
+- `processed_sample_count` is the current integer cursor on the confirmed-pair
+  processed timeline. Use it to bind external events to artifact samples
+  without assuming wall time and device sample time remain identical.
 
 An instance cannot be restarted after `stop()`. The context manager propagates
-asynchronous capture failure on a normal exit.
+asynchronous processing/callback failure on a normal exit; source loss remains
+explicit degraded status and telemetry.
 
 ## `AecFrame` and `AecState`
 
@@ -100,21 +117,28 @@ asynchronous capture failure on a normal exit.
 - `state: AecState`.
 
 `AecState` contains `echo_path_ready`, cumulative `far_end_active_s` for the
-current epoch, `alignment_epoch`, and `stream_alignment_reset_count`.
+current epoch, `echo_path_quality_ready`, the latest `echo_suppression_db`,
+consecutive `echo_quality_s`, `alignment_epoch`, and
+`stream_alignment_reset_count`.
 
 ## `CaptureStatus`
 
 `status().to_dict()` groups operational evidence into these families:
 
-- lifecycle: `running`, aggregated source/processing `error`;
-- alignment: lock/epoch, pair count, tolerance, first/mean/max skew, mismatch,
-  drop, realignment, and shutdown-tail counters;
-- devices: backend, selected name/index, real/silence/dropped block counters;
-- queues/timeline: captured audio seconds and current queue seconds;
+- lifecycle: `running`, processing `error`, and separate source errors;
+- alignment: mode/epoch, processed and matched counts, tolerance, skew,
+  clock-suspect observations, synchronization waits/backlog, degraded
+  retirements by cause, hard discontinuities, and shutdown-tail counters;
+- echo quality: readiness, active-reference time, latest measured suppression,
+  and the consecutive quality-qualified duration;
+- devices: backend, selected name/index, status/overflow/underflow and timestamp
+  anomaly counters;
+- queues/timeline: captured audio seconds, current queue seconds, callback
+  packet/payload totals, queue high-water/age, enqueue time, and timeline drift;
 - AEC: readiness, active far-end seconds, reset count; and
 - processing: mean/max processing milliseconds.
 
-Serialized captures identify `echoff-capture-artifacts-v1`. Echoff is alpha;
+Serialized captures identify `echoff-capture-artifacts-v2`. Echoff is alpha;
 validate the schema before consuming fields and use `to_dict()` rather than
 reflecting over dataclass internals.
 

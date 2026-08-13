@@ -17,7 +17,7 @@ from .capture import AecCapture
 from .config import AecConfig
 
 LOGGER = logging.getLogger(__name__)
-PLAYBACK_WINDOW_KIND = "ffplay_process_lifetime"
+PLAYBACK_WINDOW_KIND = "ffplay_process_lifetime_on_confirmed_pair_timeline"
 ANALYSIS_EDGE_TRIM_S = 0.25
 
 
@@ -62,7 +62,7 @@ def _wait(capture: AecCapture, duration_s: float) -> None:
         time.sleep(min(0.1, remaining))
 
 
-def _play_wav(capture: AecCapture, path: Path, volume: int) -> tuple[float, float]:
+def _play_wav(capture: AecCapture, path: Path, volume: int) -> tuple[int, int]:
     executable = shutil.which("ffplay")
     if executable is None:
         raise RuntimeError("ffplay is required for --play-wav")
@@ -78,7 +78,14 @@ def _play_wav(capture: AecCapture, path: Path, volume: int) -> tuple[float, floa
         str(path),
     ]
     started = time.monotonic()
-    capture.record_event("probe_playback_started", wav=str(path), volume=volume)
+    start_sample = capture.processed_sample_count
+    capture.record_event(
+        "probe_playback_started",
+        wav=str(path),
+        volume=volume,
+        sample_cursor=start_sample,
+        sample_rate_hz=capture.config.sample_rate,
+    )
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     process = subprocess.Popen(
         command,
@@ -97,12 +104,15 @@ def _play_wav(capture: AecCapture, path: Path, volume: int) -> tuple[float, floa
     if process.returncode != 0:
         raise RuntimeError(f"ffplay failed with exit code {process.returncode}")
     ended = time.monotonic()
+    end_sample = capture.processed_sample_count
     capture.record_event(
         "probe_playback_completed",
         wav=str(path),
         duration_s=ended - started,
+        sample_cursor=end_sample,
+        sample_rate_hz=capture.config.sample_rate,
     )
-    return started, ended
+    return start_sample, end_sample
 
 
 def run_probe(config: ProbeConfig) -> dict[str, Any]:
@@ -118,7 +128,7 @@ def run_probe(config: ProbeConfig) -> dict[str, Any]:
     play_wav = None if config.play_wav is None else config.play_wav.resolve()
     if play_wav is not None and not play_wav.is_file():
         raise FileNotFoundError(play_wav)
-    playback_windows_absolute: list[tuple[float, float]] = []
+    playback_windows_samples: list[tuple[int, int]] = []
     capture = AecCapture(
         config.aec,
         output_dir=output,
@@ -139,17 +149,16 @@ def run_probe(config: ProbeConfig) -> dict[str, Any]:
             _wait(capture, config.pre_roll_s)
             for index in range(config.repetitions):
                 LOGGER.info("playing stimulus %d/%d: %s", index + 1, config.repetitions, play_wav)
-                started, ended = _play_wav(capture, play_wav, config.volume)
-                playback_windows_absolute.append((started, ended))
+                start_sample, end_sample = _play_wav(capture, play_wav, config.volume)
+                playback_windows_samples.append((start_sample, end_sample))
                 if index + 1 < config.repetitions:
                     _wait(capture, config.gap_s)
             _wait(capture, config.tail_s)
-        timeline_origin = capture.timeline_started_monotonic
-        if timeline_origin is None:
+        if capture.timeline_started_monotonic is None:
             raise RuntimeError("capture produced no artifact timeline")
         playback_windows = [
-            (started - timeline_origin, ended - timeline_origin)
-            for started, ended in playback_windows_absolute
+            (start / config.aec.sample_rate, end / config.aec.sample_rate)
+            for start, end in playback_windows_samples
         ]
         capture.set_summary_metadata(
             probe={
@@ -160,6 +169,7 @@ def run_probe(config: ProbeConfig) -> dict[str, Any]:
                 "tail_s": config.tail_s,
                 "volume": config.volume,
                 "playback_window_kind": PLAYBACK_WINDOW_KIND,
+                "playback_windows_samples": playback_windows_samples,
                 "playback_windows_s": playback_windows,
                 "analysis_edge_trim_s": ANALYSIS_EDGE_TRIM_S,
             }

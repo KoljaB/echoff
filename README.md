@@ -64,8 +64,8 @@ Then start a 20-second evidence-preserving recording:
 ```
 
 While it runs, play continuous speech or music through the normal speakers for
-at least five seconds. The default readiness heuristic needs 3.25 seconds of
-active, correctly paired reference audio. Speak for part of the run only if you
+at least ten seconds. Readiness requires 7.5 seconds of active, correctly paired
+reference audio plus measured suppression of the microphone signal. Speak for part of the run only if you
 also want to check that near-end speech survives. The command prints the
 artifact directory and writes:
 
@@ -73,6 +73,8 @@ artifact directory and writes:
 computer_audio.wav   # captured render-endpoint reference
 microphone_raw.wav   # microphone before AEC
 microphone_aec.wav   # microphone after AEC
+reference_received.wav  # every received reference payload in source order
+microphone_received.wav # every received microphone payload in source order
 events.jsonl         # lifecycle and alignment events
 config.json          # effective AEC configuration
 summary.json         # devices, counters, timing, and final status
@@ -95,9 +97,12 @@ WebRTC with the wrong echo reference even when both streams have the same block
 count. Echoff instead:
 
 1. captures the render reference and microphone on separate streams;
-2. pairs blocks by monotonic end timestamp;
-3. realigns and resets the adaptive filter after a discontinuity; and
-4. submits each reference frame immediately before its matching microphone
+2. maps each stream's PortAudio estimate into one local monotonic domain;
+3. establishes one sequence offset at startup and then treats received sample
+   order as authoritative;
+4. waits symmetrically for a temporarily late counterpart instead of creating
+   a synthetic slot; and
+5. submits each reference frame immediately before its matching microphone
    frame.
 
 This is the capture-and-alignment layer that a bare AEC wrapper does not
@@ -183,17 +188,30 @@ Windows output -> WASAPI loopback -> timestamp queue --+
 Physical mic  -> WASAPI / WDM-KS -> timestamp queue ---+
 ```
 
-Startup phase differences and later discontinuities are realigned instead of
-silently pairing stale frames. Each realignment starts a fresh AEC epoch. The
-`echo_path_ready` state turns true only after 3.25 seconds of paired, active
-far-end audio; the application decides whether that state should gate VAD or
-barge-in.
+Startup needs three consistent observations to establish the sequence mapping.
+After lock, matching heads are processed immediately. If either expected head
+is missing, Echoff starts a wait when the pairing worker first observes it and
+buffers both directions for up to three seconds. A counterpart that arrives
+inside that reserve drains in order with the same mapping: no synthetic audio,
+payload discard, or WebRTC reset is involved.
 
-This is continuous timestamp checking with runtime realignment, not automatic
-tuning of the WebRTC `stream_delay_ms` hint. A late block from an active Windows
-loopback stream keeps its original scheduler slot for a bounded 100 ms grace;
-only a longer absence is classified as endpoint idle and filled with
-clock-continuous silence.
+If the reserve expires or a source fails, Echoff marks alignment degraded and
+suspends unsafe paired AEC output. With `output_dir` enabled, every received
+source payload continues into its raw source track while bounded live buffers
+may be retired with explicit cause counters. Source errors remain visible in
+status and events; processing/callback failures and an unsafe unbounded backlog
+remain health errors. A proven sequence discontinuity opens one new epoch and
+resets WebRTC at most once.
+
+The `echo_path_ready` state turns true only after at least 7.5 seconds of paired,
+active far-end audio and 250 ms of stable measured suppression of at least 10 dB
+over a rolling one-second window. The application decides whether that state
+should gate VAD or barge-in. Echoff does not resample the live streams or automatically retune the
+configured WebRTC `stream_delay_ms` hint. The Windows backend uses PortAudio
+callback timestamps from one shared WASAPI host context. After startup those
+timestamps are diagnostics only: they cannot invent samples, renumber pairs, or
+commit a live rate correction. Relative hardware-rate correction remains out of
+scope for 0.1.
 
 ## Validate on your hardware
 
@@ -213,11 +231,12 @@ seeing the result.
 
 ## Documentation
 
+- [Logging](https://github.com/KoljaB/echoff/blob/main/docs/logging.md) - configure application logs and control visible runtime diagnostics.
 - [Documentation home](https://github.com/KoljaB/echoff/blob/main/docs/README.md) — every guide, grouped by task.
 - [Getting started](https://github.com/KoljaB/echoff/blob/main/docs/getting-started.md) and [CLI](https://github.com/KoljaB/echoff/blob/main/docs/cli.md) — install, select devices, and complete the first capture.
 - [Integration](https://github.com/KoljaB/echoff/blob/main/docs/integration.md) and [Python API](https://github.com/KoljaB/echoff/blob/main/docs/python-api.md) — choose an ownership model and wire Echoff safely.
 - [Hardware probe](https://github.com/KoljaB/echoff/blob/main/docs/hardware-probe.md) and [Troubleshooting](https://github.com/KoljaB/echoff/blob/main/docs/troubleshooting.md) — validate real hardware and diagnose failures.
-- [Architecture](https://github.com/KoljaB/echoff/blob/main/docs/architecture.md) and [Platform support](https://github.com/KoljaB/echoff/blob/main/docs/platforms.md) — understand timing, realignment, and OS boundaries.
+- [Architecture](https://github.com/KoljaB/echoff/blob/main/docs/architecture.md) and [Platform support](https://github.com/KoljaB/echoff/blob/main/docs/platforms.md) — understand timing, clock drift, and OS boundaries.
 
 ## Privacy
 

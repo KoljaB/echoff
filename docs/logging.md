@@ -6,6 +6,12 @@ Echoff uses Python's `echoff` logger hierarchy. Importing the package attaches
 only a `NullHandler`; it never configures the root logger or installs an
 emitting handler behind the application's back.
 
+`AecCapture` separately prints critical runtime diagnostics (including a lost
+reference mapping, realignment, or capture failure) to `stderr` by default.
+Warnings and errors are red in an interactive terminal. Pass
+`console_diagnostics=False` to `AecCapture` when the application already
+surfaces structured `on_event` notifications and must suppress these prints.
+
 Applications may use ordinary `logging` configuration or the opt-in helper:
 
 ```python

@@ -70,7 +70,7 @@ def _window(samples: Sequence[float], rate: int, start: float, end: float) -> Se
     start_index = round(start * rate)
     end_index = round(end * rate)
     if start_index < 0 or end_index <= start_index or end_index > len(samples):
-        raise ValueError(f"window {start}:{end} is outside the shared microphone timeline")
+        raise ValueError(f"window {start}:{end} is outside the shared processed timeline")
     return samples[start_index:end_index]
 
 
@@ -90,7 +90,7 @@ def _level_comparison(
         raw_values = _window(raw, rate, start, end)
         clean_values = _window(clean, rate, start, end)
         if not raw_values or len(raw_values) != len(clean_values):
-            raise ValueError(f"window {start}:{end} is outside the shared microphone timeline")
+            raise ValueError(f"window {start}:{end} is outside the shared processed timeline")
         raw_rms = rms(raw_values)
         clean_rms = rms(clean_values)
         value_db = 20.0 * math.log10(max(raw_rms, 1e-9) / max(clean_rms, 1e-9))
@@ -128,7 +128,7 @@ def _near_end_comparison(
         raw_values = _window(raw, rate, start, end)
         clean_values = _window(clean, rate, start, end)
         if not raw_values or len(raw_values) != len(clean_values):
-            raise ValueError(f"window {start}:{end} is outside the shared microphone timeline")
+            raise ValueError(f"window {start}:{end} is outside the shared processed timeline")
         raw_rms = rms(raw_values)
         clean_rms = rms(clean_values)
         rows.append(

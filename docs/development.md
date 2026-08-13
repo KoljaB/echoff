@@ -31,8 +31,9 @@ a release.
 
 1. Processor tests inject a fake APM and prove 10 ms ordering, buffering, reset,
    and warm-up behavior.
-2. Aligner tests use deterministic timestamps and prove startup, tolerance, and
-   runtime realignment.
+2. Clock/aligner tests preserve sample identity and prove startup/rejoin,
+   timestamp-noise rejection, symmetric wait/recovery, and discontinuity
+   barriers without live clock correction.
 3. Capture tests inject fake sources and verify callbacks, failure propagation,
    and equal artifact timelines.
 4. Backend unit tests fake host APIs and never open physical devices.
@@ -47,15 +48,18 @@ device timing or echo behavior.
 Implement `CaptureSource`, return `DeviceInfo` rows from a device lister, and
 add one factory branch. Backends must:
 
-- emit fixed-size mono float blocks at the configured rate;
-- supply finite, strictly increasing monotonic block-end timestamps;
-- preserve clock-continuous silence rather than pausing callbacks;
-- report real/synthetic/dropped block counters and selected device identity;
+- preserve every parseable callback sample and emit fixed-size mono float blocks
+  through `FixedBlockSampleClock`;
+- supply finite, strictly increasing canonical block ends plus optional mapped
+  PortAudio timing observations;
+- tolerate a silent/paused reference source without fabricating source payloads;
+- report callback status, timestamp anomaly, synthetic/padded sample, and device
+  identity counters;
 - stop and clean up both success and failure paths; and
 - contain no WebRTC, VAD, ASR, TTS, recording, or application policy.
 
 Before support is claimed on a new platform, preserve evidence for startup
-alignment, runtime discontinuity recovery, far-end suppression, near-end
+alignment, long-running clock drift, far-end suppression, near-end
 retention, device selection, disconnect/cleanup, and repeated cold starts.
 
 ## Documentation contract

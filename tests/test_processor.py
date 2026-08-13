@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import unittest
+from array import array
 from typing import ClassVar
 
 from echoff import (
@@ -25,6 +26,7 @@ class FakeRtc:
 
 class FakeApm:
     instances: ClassVar[list[FakeApm]] = []
+    output_gain: ClassVar[float] = 1.0
 
     def __init__(self, **options: object) -> None:
         self.options = options
@@ -38,13 +40,21 @@ class FakeApm:
     def process_reverse_stream(self, _frame: FakeFrame) -> None:
         self.calls.append("reference")
 
-    def process_stream(self, _frame: FakeFrame) -> None:
+    def process_stream(self, frame: FakeFrame) -> None:
         self.calls.append("microphone")
+        if self.output_gain == 1.0:
+            return
+        values = array("h")
+        values.frombytes(bytes(frame.data))
+        for index, value in enumerate(values):
+            values[index] = round(value * self.output_gain)
+        frame.data[:] = values.tobytes()
 
 
 class WebRtcAecProcessorTests(unittest.TestCase):
     def setUp(self) -> None:
         FakeApm.instances.clear()
+        FakeApm.output_gain = 1.0
 
     def processor(self, **config_values: object) -> WebRtcAecProcessor:
         return WebRtcAecProcessor(
@@ -88,18 +98,25 @@ class WebRtcAecProcessorTests(unittest.TestCase):
         silent = [0.0] * 480
         below = [0.00099] * 480
         active = [0.001] * 480
+        leaked = [0.1] * 480
+        FakeApm.output_gain = 0.1
 
         processor.process_pair(silent, silent)
         processor.process_pair(below, silent)
         self.assertEqual(processor.state.far_end_active_s, 0.0)
 
         for _index in range(324):
-            processor.process_pair(active, silent)
+            processor.process_pair(active, leaked)
         self.assertAlmostEqual(processor.state.far_end_active_s, 3.24)
         self.assertFalse(processor.state.echo_path_ready)
 
-        processor.process_pair(active, silent)
+        processor.process_pair(active, leaked)
+        self.assertFalse(processor.state.echo_path_ready)
+        for _index in range(24):
+            processor.process_pair(active, leaked)
         self.assertTrue(processor.state.echo_path_ready)
+        self.assertTrue(processor.state.echo_path_quality_ready)
+        self.assertAlmostEqual(processor.state.echo_quality_s, 0.25)
         self.assertEqual(processor.state.alignment_epoch, 0)
 
         first_apm = FakeApm.instances[-1]
@@ -109,6 +126,52 @@ class WebRtcAecProcessorTests(unittest.TestCase):
         self.assertEqual(processor.state.far_end_active_s, 0.0)
         self.assertEqual(processor.state.alignment_epoch, 1)
         self.assertEqual(processor.state.stream_alignment_reset_count, 1)
+        self.assertFalse(processor.state.echo_path_quality_ready)
+        self.assertIsNone(processor.state.echo_suppression_db)
+
+    def test_active_reference_without_measured_suppression_never_reports_ready(self) -> None:
+        processor = self.processor(
+            echo_path_warmup_s=0.0,
+            echo_path_quality_window_s=0.1,
+            echo_path_quality_stable_s=0.05,
+        )
+        active = [0.2] * 480
+        leaked = [0.1] * 480
+
+        for _index in range(100):
+            processor.process_pair(active, leaked)
+
+        self.assertFalse(processor.state.echo_path_ready)
+        self.assertAlmostEqual(processor.state.echo_suppression_db or 0.0, 0.0, places=2)
+
+    def test_quality_readiness_revokes_without_reset_and_can_recover(self) -> None:
+        processor = self.processor(
+            echo_path_warmup_s=0.0,
+            echo_path_quality_window_s=0.1,
+            echo_path_quality_stable_s=0.05,
+        )
+        active = [0.2] * 480
+        leaked = [0.1] * 480
+        FakeApm.output_gain = 0.1
+
+        for _index in range(14):
+            processor.process_pair(active, leaked)
+        self.assertTrue(processor.state.echo_path_ready)
+
+        apm = FakeApm.instances[-1]
+        FakeApm.output_gain = 1.0
+        for _index in range(10):
+            processor.process_pair(active, leaked)
+        self.assertFalse(processor.state.echo_path_ready)
+        self.assertIs(FakeApm.instances[-1], apm)
+        self.assertEqual(processor.state.alignment_epoch, 0)
+        self.assertEqual(processor.state.stream_alignment_reset_count, 0)
+
+        FakeApm.output_gain = 0.1
+        for _index in range(14):
+            processor.process_pair(active, leaked)
+        self.assertTrue(processor.state.echo_path_ready)
+        self.assertIs(FakeApm.instances[-1], apm)
 
     def test_native_apm_reduces_synthetic_echo_and_retains_near_end(self) -> None:
         try:
