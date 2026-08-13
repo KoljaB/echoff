@@ -16,9 +16,11 @@ and echo-reduced microphone PCM.
 
 ## Hear the difference
 
-The same 14-second microphone capture, before and after Echoff's acoustic echo
-cancellation. Headphones make the comparison easiest to hear:
+The same 14-second moment from a live gameplay session: computer playback, the
+physical microphone before AEC, and Echoff's output. Headphones make the
+comparison easiest to hear:
 
+- [▶ Computer audio — cancellation reference](https://raw.githubusercontent.com/KoljaB/echoff/main/assets/reference_signal.wav)
 - [▶ Original microphone signal — echo present](https://raw.githubusercontent.com/KoljaB/echoff/main/assets/original_signal.wav)
 - [▶ Echoff output — echo reduced](https://raw.githubusercontent.com/KoljaB/echoff/main/assets/aec_signal.wav)
 
