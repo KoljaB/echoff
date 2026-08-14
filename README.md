@@ -6,13 +6,16 @@
 [![Typed](https://img.shields.io/badge/typing-py.typed-2f74c0)](https://peps.python.org/pep-0561/)
 [![Windows capture](https://img.shields.io/badge/live_capture-Windows-0078d4)](https://github.com/KoljaB/echoff/blob/main/docs/platforms.md)
 
-**Reduce computer-speaker audio leaking back into a live microphone stream.**
+**Echo off. Clean microphone on.**
 
-Echoff is a focused Python package for synchronized duplex capture and real-time
-acoustic echo cancellation (AEC). It timestamp-aligns Windows system-audio
-loopback and microphone blocks *before* feeding matched frame pairs to WebRTC's
-Audio Processing Module. Applications receive the reference, raw microphone,
-and echo-reduced microphone PCM.
+Stop your local voice agent from transcribing its own voice.
+
+When a local voice agent talks through your speakers, the microphone can pick
+up its voice and feed it back to speech recognition as if you had said it.
+Echoff synchronizes Windows system-audio loopback and microphone capture, then
+uses WebRTC acoustic echo cancellation (AEC) to reduce that playback before
+your application receives the microphone stream. Applications get the matched
+reference, raw microphone, and echo-reduced microphone PCM.
 
 ## Hear the difference
 
