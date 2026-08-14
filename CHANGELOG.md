@@ -2,6 +2,27 @@
 
 All notable changes will be documented here.
 
+## 0.2.0 - 2026-08-14
+
+- Add built-in Linux live capture through PipeWire while leaving the Windows
+  WASAPI backend unchanged.
+- Select native PipeWire node serials and capture fixed 48 kHz mono 20 ms
+  blocks from a sink monitor and microphone source.
+- Gate microphone startup on the reference recorder and preserve reference
+  pre-roll instead of dropping or synthesizing audio.
+- Report recorder startup, disconnect, and unexpected-EOF failures with the
+  affected node, exit status, and bounded recorder diagnostics.
+- Give an exact numeric PipeWire device index precedence over a matching name
+  fragment, including names such as `SPEAK 510` that contain another index.
+- Add Linux backend failure-path tests and a Windows/Linux CI matrix.
+- Document Linux installation, device selection, capture, playback probes, and
+  artifact checks.
+- Qualify the first Linux configuration on Ubuntu with PipeWire, a Jabra Speak
+  510 microphone, and analog stereo output. A 598-second run processed 29,885
+  pairs with no failures, drops, degradation, timeouts, clock corrections,
+  discontinuities, or APM resets; it measured 22.63 dB aggregate far-end
+  suppression and zero clipped microphone samples at 80% input gain.
+
 ## 0.1.4 - 2026-08-14
 
 - Make received sample order authoritative and treat PortAudio timestamps as

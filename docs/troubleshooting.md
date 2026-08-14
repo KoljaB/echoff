@@ -141,11 +141,13 @@ python -m echoff record --output captures\probe-002
 Do not delete an earlier directory until you have confirmed it contains no
 unique recording or diagnostic data.
 
-## Linux or macOS reports unsupported platform
+## Linux reports a missing PipeWire tool
 
-Built-in device listing and capture are Windows-only in 0.1. The portable
-processor classes remain importable when your application supplies correctly
-aligned PCM. See [Platform support](platforms.md).
+Linux live capture requires `pactl`, `pw-dump`, and `pw-record` from the host's
+PipeWire installation. Install the distribution's PipeWire and PulseAudio
+compatibility utilities, then rerun `echoff devices`. macOS has no built-in
+capture backend; its portable processor classes remain available for
+application-owned aligned PCM. See [Platform support](platforms.md).
 
 ## Before filing an issue
 

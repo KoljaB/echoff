@@ -4,13 +4,13 @@
 [![Python](https://img.shields.io/pypi/pyversions/echoff.svg)](https://pypi.org/project/echoff/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/KoljaB/echoff/blob/main/LICENSE)
 [![Typed](https://img.shields.io/badge/typing-py.typed-2f74c0)](https://peps.python.org/pep-0561/)
-[![Windows capture](https://img.shields.io/badge/live_capture-Windows-0078d4)](https://github.com/KoljaB/echoff/blob/main/docs/platforms.md)
+[![Live capture](https://img.shields.io/badge/live_capture-Windows%20%7C%20Linux-0078d4)](https://github.com/KoljaB/echoff/blob/main/docs/platforms.md)
 
 **Echo off. Clean microphone on.**
 
 Stops your voice agent from transcribing its own voice.
 
-When your agent speaks through the selected Windows output device, its playback
+When your agent speaks through the selected output device, its playback
 can leak into the microphone and reach speech recognition as if you had said it.
 Echoff synchronizes that system-audio loopback with microphone capture, then
 uses WebRTC acoustic echo cancellation (AEC) to reduce the playback before your
@@ -31,16 +31,16 @@ If the player is unavailable, [open the comparison video](https://github.com/use
 The raw-microphone and Echoff-output tracks use the same +8 dB monitor gain so
 quiet details remain audible. The computer-audio reference is unmodified.
 
-> **Note:** Echoff 0.1 is alpha software. Built-in live capture is
-> hardware-tested on Windows 10/11. Linux and macOS capture backends are not
-> implemented.
+> **Note:** Echoff 0.2 is alpha software. Built-in live capture is
+> hardware-tested on Windows 10/11 and Ubuntu with PipeWire. The macOS capture
+> backend is not implemented.
 
 ## Support at a glance
 
 | Platform | Built-in live capture | Processor-only use with aligned PCM |
 |---|---|---|
 | Windows 10/11 | **Supported**: WASAPI loopback + WASAPI microphone, with WDM-KS microphone fallback | Supported |
-| Linux | Planned: PipeWire backend | Designed for application-owned PCM where LiveKit installs; not qualified here |
+| Linux | PipeWire sink monitor + microphone source | Supported |
 | macOS | Not implemented | Designed for application-owned PCM where LiveKit installs; not qualified here |
 
 Python 3.11 or newer is required. See [Platform support](https://github.com/KoljaB/echoff/blob/main/docs/platforms.md)
@@ -96,6 +96,37 @@ is present; use a controlled far-end-only window before calling a number echo
 suppression. The [hardware probe guide](https://github.com/KoljaB/echoff/blob/main/docs/hardware-probe.md)
 shows the repeatable path.
 
+## Three-minute Linux quickstart
+
+Install the PipeWire command-line tools. On Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install pipewire-bin pulseaudio-utils
+```
+
+Create an isolated environment and install the published package:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install echoff
+```
+
+List the available sink monitors and microphone sources, then record the same
+raw-vs-clean comparison:
+
+```bash
+.venv/bin/python -m echoff devices
+.venv/bin/python -m echoff record --duration 20
+```
+
+PipeWire's default sink monitor and source are selected automatically. If they
+are not the physical stereo and microphone you want, pass their displayed
+indexes with `--reference-device` and `--microphone-device`. See the
+[Linux getting-started guide](https://github.com/KoljaB/echoff/blob/main/docs/getting-started-linux.md)
+for explicit routing and repeatable playback probes.
+
 ## Why Echoff exists
 
 System loopback and microphone devices start independently. Matching their
@@ -104,7 +135,7 @@ WebRTC with the wrong echo reference even when both streams have the same block
 count. Echoff instead:
 
 1. captures the render reference and microphone on separate streams;
-2. maps each stream's callback timestamp into one local monotonic domain;
+2. maps each stream's source timing into one local monotonic domain;
 3. establishes one sequence offset at startup and then treats received sample
    order as authoritative;
 4. waits symmetrically for a temporarily late counterpart instead of creating
@@ -190,12 +221,12 @@ before wiring physical devices or separate capture clocks.
 ## How the live path works
 
 ```text
-Windows output -> WASAPI loopback -> fixed-block queue --+
-                                                        +-> align -> WebRTC APM -> AecFrame
-Physical mic  -> WASAPI / WDM-KS -> fixed-block queue ---+
+System output -> platform loopback -> fixed-block queue --+
+                                                         +-> align -> WebRTC APM -> AecFrame
+Physical mic -> platform capture -> fixed-block queue ----+
 ```
 
-At startup, Echoff uses callback timestamps to establish the sequence mapping.
+At startup, Echoff uses source timing to establish the sequence mapping.
 After lock, received sample order is authoritative. If either expected head is
 missing, Echoff waits symmetrically for its counterpart instead of creating
 synthetic audio. The configured stall reserve defaults to three seconds and
@@ -232,7 +263,7 @@ seeing the result.
 
 - [Logging](https://github.com/KoljaB/echoff/blob/main/docs/logging.md) — configure application logs and control visible runtime diagnostics.
 - [Documentation home](https://github.com/KoljaB/echoff/blob/main/docs/README.md) — every guide, grouped by task.
-- [Getting started](https://github.com/KoljaB/echoff/blob/main/docs/getting-started.md) and [CLI](https://github.com/KoljaB/echoff/blob/main/docs/cli.md) — install, select devices, and complete the first capture.
+- [Windows getting started](https://github.com/KoljaB/echoff/blob/main/docs/getting-started.md), [Linux getting started](https://github.com/KoljaB/echoff/blob/main/docs/getting-started-linux.md), and [CLI](https://github.com/KoljaB/echoff/blob/main/docs/cli.md) — install, select devices, and complete the first capture.
 - [Integration](https://github.com/KoljaB/echoff/blob/main/docs/integration.md) and [Python API](https://github.com/KoljaB/echoff/blob/main/docs/python-api.md) — choose an ownership model and wire Echoff safely.
 - [Hardware probe](https://github.com/KoljaB/echoff/blob/main/docs/hardware-probe.md), [Capture artifacts](https://github.com/KoljaB/echoff/blob/main/docs/capture-artifacts.md), and [Troubleshooting](https://github.com/KoljaB/echoff/blob/main/docs/troubleshooting.md) — validate real hardware and diagnose failures.
 - [Architecture](https://github.com/KoljaB/echoff/blob/main/docs/architecture.md) and [Platform support](https://github.com/KoljaB/echoff/blob/main/docs/platforms.md) — understand timing, clock drift, and OS boundaries.

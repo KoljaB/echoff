@@ -6,8 +6,10 @@ Choose the shortest path that matches what you are trying to do.
 
 ## Start
 
-- [Getting started](getting-started.md) — install the PyPI package on Windows,
-  confirm devices, and record the first inspectable session.
+- [Windows getting started](getting-started.md) — install the PyPI package,
+  confirm devices, and record the first inspectable Windows session.
+- [Linux getting started](getting-started-linux.md) — install PipeWire tools,
+  select a sink monitor and microphone, and validate a Linux session.
 - [Command-line interface](cli.md) — commands, flags, defaults, and exit codes.
 
 ## Integrate
@@ -31,8 +33,8 @@ Choose the shortest path that matches what you are trying to do.
 
 - [Architecture](architecture.md) — why timestamps matter and how startup
   pairing, symmetric recovery, and WebRTC APM interact.
-- [Platform support](platforms.md) — built-in Windows capture and the portable
-  processor boundary.
+- [Platform support](platforms.md) — built-in Windows and Linux capture plus
+  the portable processor boundary.
 
 ## Contribute and release
 
@@ -44,8 +46,9 @@ Choose the shortest path that matches what you are trying to do.
 
 ## Current support boundary
 
-Echoff 0.1 is alpha software. Built-in physical capture is supported on
-Windows. The Linux and macOS processor paths are designed for applications that
-already own correctly aligned PCM and environments where LiveKit installs;
-they are not CI- or hardware-qualified by this project. The repository
-is licensed under the [MIT License](../LICENSE).
+Echoff 0.2 is alpha software. Built-in physical capture is supported on
+Windows and Linux. Linux live capture requires PipeWire command-line tools.
+The macOS processor path is designed for applications that already own
+correctly aligned PCM and environments where LiveKit installs, but it is not
+CI- or hardware-qualified and built-in macOS capture is not implemented. The
+repository is licensed under the [MIT License](../LICENSE).

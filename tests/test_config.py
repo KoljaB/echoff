@@ -7,6 +7,9 @@ from echoff import AecConfig
 
 
 class AecConfigTests(unittest.TestCase):
+    def test_pipewire_backend_is_an_explicit_valid_choice(self) -> None:
+        self.assertEqual(AecConfig(backend="pipewire").backend, "pipewire")
+
     def test_defaults_match_the_validated_capture_contract(self) -> None:
         config = AecConfig()
 

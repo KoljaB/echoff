@@ -96,7 +96,7 @@ class AecConfig:
             raise ValueError(
                 "echo_path_quality_min_raw_rms must be finite and non-negative"
             )
-        if self.backend not in {"auto", "windows"}:
+        if self.backend not in {"auto", "windows", "pipewire"}:
             raise ValueError(f"unsupported backend: {self.backend!r}")
 
     @property

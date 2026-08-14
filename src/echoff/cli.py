@@ -56,11 +56,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     record.add_argument(
         "--reference-device",
-        help="WASAPI loopback index or unique case-insensitive name fragment",
+        help="reference-device index or unique case-insensitive name fragment",
     )
     record.add_argument(
         "--microphone-device",
-        help="WASAPI microphone index or unique case-insensitive name fragment",
+        help="microphone-device index or unique case-insensitive name fragment",
     )
     record.add_argument(
         "--stream-delay-ms",

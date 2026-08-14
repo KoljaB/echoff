@@ -7,7 +7,7 @@ Echoff separates portable processing from platform-specific device capture.
 | Platform | `AecCapture`, `devices`, `record` | Processor classes |
 |---|---|---|
 | Windows 10/11 | Supported and physically tested | Supported |
-| Linux | Not implemented; PipeWire backend planned | Designed for application-owned aligned PCM where LiveKit installs; not qualified here |
+| Linux | PipeWire backend; physically qualified on Ubuntu | Supported |
 | macOS | Not implemented; no committed backend roadmap | Designed for application-owned aligned PCM where LiveKit installs; not qualified here |
 
 ## Windows
@@ -32,10 +32,23 @@ Known operational boundaries:
 
 ## Linux
 
-A future backend should capture a PipeWire sink monitor and microphone source
-while preserving clock-continuous silence and monotonic block-end timestamps.
-The backend must pass real duplex hardware and echo-suppression tests before
-support is claimed.
+The PipeWire backend captures a sink monitor as the render reference and an
+ordinary PipeWire source as the microphone. It uses the system `pactl` and
+`pw-record` tools, requests 48 kHz mono streams, emits fixed 20 ms blocks, and
+keeps monotonically increasing block-end timestamps on each stream's sample
+clock. `echoff devices` lists monitor sources as references and other sources
+as microphones.
+
+The selected output monitor must correspond to the physical output that can
+reach the selected microphone. Select explicit devices when PipeWire's default
+sink or source is not the desired hardware.
+
+The qualified Ubuntu configuration used PipeWire 1.0.5, a Jabra Speak 510
+microphone, and built-in analog stereo output. Its 598-second periodic-playback
+run processed 29,885 pairs without source failures, dropped or degraded blocks,
+synchronization timeouts, clock corrections, discontinuities, or APM resets.
+This qualifies that configuration; it does not claim equivalent physical
+coverage for every distribution, PipeWire release, or audio device.
 
 ## macOS
 
@@ -52,7 +65,6 @@ where the LiveKit WebRTC APM dependency is available, but the host must supply
 48 kHz mono PCM and honor the alignment/ordering contract. Code availability is
 not the same as a physically qualified platform integration.
 
-`AecConfig(backend="auto")` is valid on every platform; creating built-in
-capture sources outside Windows raises `UnsupportedPlatformError`.
+`AecConfig(backend="auto")` selects WASAPI on Windows and PipeWire on Linux.
 
 Next: [Integration](integration.md) · [Architecture](architecture.md)
