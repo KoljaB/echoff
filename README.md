@@ -8,9 +8,9 @@
 
 **Echo off. Clean microphone on.**
 
-Stop your local voice agent from transcribing its own voice.
+Stop your voice agent from transcribing its own voice.
 
-When a local voice agent talks through your speakers, the microphone can pick
+When a voice agent talks through your speakers, the microphone can pick
 up its voice and feed it back to speech recognition as if you had said it.
 Echoff synchronizes Windows system-audio loopback and microphone capture, then
 uses WebRTC acoustic echo cancellation (AEC) to reduce that playback before
