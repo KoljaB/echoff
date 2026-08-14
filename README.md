@@ -8,7 +8,7 @@
 
 **Echo off. Clean microphone on.**
 
-Stop your voice agent from transcribing its own voice.
+Stops your voice agent from transcribing its own voice.
 
 When a voice agent talks through your speakers, the microphone can pick
 up its voice and feed it back to speech recognition as if you had said it.
