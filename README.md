@@ -20,9 +20,19 @@ The same 14-second moment from a live gameplay session: computer playback, the
 physical microphone before AEC, and Echoff's output. Headphones make the
 comparison easiest to hear:
 
-- [▶ Computer audio — cancellation reference](https://raw.githubusercontent.com/KoljaB/echoff/main/assets/reference_signal.wav)
-- [▶ Original microphone signal — echo present](https://raw.githubusercontent.com/KoljaB/echoff/main/assets/original_signal.wav)
-- [▶ Echoff output — echo reduced](https://raw.githubusercontent.com/KoljaB/echoff/main/assets/aec_signal.wav)
+**1. Computer audio — cancellation reference**
+
+https://github.com/user-attachments/assets/d12a0150-2043-4ac0-93f6-cf32f9e5ac06
+
+**2. Original microphone signal — echo present**
+
+https://github.com/user-attachments/assets/7a4b879d-26e8-459b-b904-d812938d80dd
+
+**3. Echoff output — echo reduced**
+
+https://github.com/user-attachments/assets/d7049699-87dd-408c-b12b-c206c81046fa
+
+GitHub starts embedded media muted; use the speaker button before comparing.
 
 > **Project status:** Echoff 0.1 is alpha software. Built-in live capture is
 > physically tested on Windows. The processor APIs are designed for
