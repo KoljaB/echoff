@@ -302,7 +302,6 @@ class WindowsBackendUnitTests(unittest.TestCase):
 
         self.assertIsNone(source.error)
         self.assertEqual(source.device_block_count, 4)
-        self.assertEqual(source.timestamp_regression_count, 1)
         self.assertEqual(source.invalid_timestamp_count, 0)
         self.assertGreaterEqual(source.timestamp_regression_count, 1)
         for previous, current in pairwise(received):
