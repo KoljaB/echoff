@@ -20,17 +20,9 @@ The same 14-second moment from a live gameplay session: computer playback, the
 physical microphone before AEC, and Echoff's output. Headphones make the
 comparison easiest to hear:
 
-**1. Computer audio — cancellation reference**
-
-https://github.com/user-attachments/assets/d12a0150-2043-4ac0-93f6-cf32f9e5ac06
-
-**2. Original microphone signal — echo present**
-
-https://github.com/user-attachments/assets/7a4b879d-26e8-459b-b904-d812938d80dd
-
-**3. Echoff output — echo reduced**
-
-https://github.com/user-attachments/assets/d7049699-87dd-408c-b12b-c206c81046fa
+| 1. Echoff output — echo reduced | 2. Original microphone — echo present | 3. Computer audio — reference |
+|---|---|---|
+| <video src="https://github.com/user-attachments/assets/d7049699-87dd-408c-b12b-c206c81046fa" controls></video> | <video src="https://github.com/user-attachments/assets/7a4b879d-26e8-459b-b904-d812938d80dd" controls></video> | <video src="https://github.com/user-attachments/assets/d12a0150-2043-4ac0-93f6-cf32f9e5ac06" controls></video> |
 
 GitHub starts embedded media muted; use the speaker button before comparing.
 
