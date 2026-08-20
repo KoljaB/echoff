@@ -23,6 +23,8 @@ class AecProcessor(Protocol):
         microphone: Sequence[float],
     ) -> tuple[float, ...]: ...
 
+    def reset_echo_path(self) -> None: ...
+
     def reset_alignment(self) -> None: ...
 
     @property
@@ -66,6 +68,7 @@ class WebRtcAecProcessor:
         self._quality_good_frames = 0
         self._alignment_epoch = 0
         self._stream_alignment_reset_count = 0
+        self._echo_path_reset_count = 0
 
     def _new_apm(self) -> Any:
         apm = self._apm_type(
@@ -171,16 +174,26 @@ class WebRtcAecProcessor:
             self._quality_good_frames >= self.config.echo_path_quality_stable_frames
         )
 
+    def _reset_echo_path_locked(self) -> None:
+        self._apm = self._new_apm()
+        self._paired_far_end_active_frames = 0
+        self._quality_frames.clear()
+        self._echo_path_quality_ready = False
+        self._echo_suppression_db = None
+        self._quality_good_frames = 0
+        self._echo_path_reset_count += 1
+
+    def reset_echo_path(self) -> None:
+        """Cold-start the adaptive filter without changing stream alignment."""
+
+        with self._lock:
+            self._reset_echo_path_locked()
+
     def reset_alignment(self) -> None:
         """Create a fresh APM and cold echo-path epoch after realignment."""
 
         with self._lock:
-            self._apm = self._new_apm()
-            self._paired_far_end_active_frames = 0
-            self._quality_frames.clear()
-            self._echo_path_quality_ready = False
-            self._echo_suppression_db = None
-            self._quality_good_frames = 0
+            self._reset_echo_path_locked()
             self._alignment_epoch += 1
             self._stream_alignment_reset_count += 1
 
@@ -196,6 +209,7 @@ class WebRtcAecProcessor:
                 echo_path_quality_ready=self._echo_path_quality_ready,
                 echo_suppression_db=self._echo_suppression_db,
                 echo_quality_s=self._quality_good_frames / 100.0,
+                echo_path_reset_count=self._echo_path_reset_count,
             )
 
 
@@ -260,17 +274,22 @@ class StreamingWebRtcAecProcessor(WebRtcAecProcessor):
                 )
         return tuple(output)
 
+    def reset_echo_path(self) -> None:
+        """Cold-start AEC at a synchronized streaming boundary."""
+
+        with self._lock:
+            if self._reference_activity_pending:
+                raise RuntimeError(
+                    "streaming echo-path reset requires a synchronized boundary"
+                )
+            self._reset_echo_path_locked()
+
     def reset_alignment(self) -> None:
         with self._lock:
-            self._apm = self._new_apm()
+            self._reset_echo_path_locked()
             self._reference_pending.clear()
             self._microphone_pending.clear()
             self._reference_activity_pending.clear()
-            self._paired_far_end_active_frames = 0
-            self._quality_frames.clear()
-            self._echo_path_quality_ready = False
-            self._echo_suppression_db = None
-            self._quality_good_frames = 0
             self._alignment_epoch += 1
             self._stream_alignment_reset_count += 1
 
@@ -338,14 +357,9 @@ class BufferedWebRtcAecProcessor(WebRtcAecProcessor):
 
     def reset_alignment(self) -> None:
         with self._lock:
-            self._apm = self._new_apm()
+            self._reset_echo_path_locked()
             self._reference_pending.clear()
             self._microphone_pending.clear()
-            self._paired_far_end_active_frames = 0
-            self._quality_frames.clear()
-            self._echo_path_quality_ready = False
-            self._echo_suppression_db = None
-            self._quality_good_frames = 0
             self._alignment_epoch += 1
             self._stream_alignment_reset_count += 1
 
@@ -354,27 +368,38 @@ class PassthroughAecProcessor:
     """Pair-preserving processor for capture sessions with AEC disabled."""
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self._alignment_epoch = 0
         self._reset_count = 0
+        self._echo_path_reset_count = 0
 
     def process_pair(
         self,
         reference: Sequence[float],
         microphone: Sequence[float],
     ) -> tuple[float, ...]:
-        if len(reference) != len(microphone):
-            raise ValueError("reference and microphone blocks must have equal lengths")
-        return tuple(microphone)
+        with self._lock:
+            if len(reference) != len(microphone):
+                raise ValueError("reference and microphone blocks must have equal lengths")
+            return tuple(microphone)
+
+    def reset_echo_path(self) -> None:
+        with self._lock:
+            self._echo_path_reset_count += 1
 
     def reset_alignment(self) -> None:
-        self._alignment_epoch += 1
-        self._reset_count += 1
+        with self._lock:
+            self._alignment_epoch += 1
+            self._reset_count += 1
+            self._echo_path_reset_count += 1
 
     @property
     def state(self) -> AecState:
-        return AecState(
-            echo_path_ready=False,
-            far_end_active_s=0.0,
-            alignment_epoch=self._alignment_epoch,
-            stream_alignment_reset_count=self._reset_count,
-        )
+        with self._lock:
+            return AecState(
+                echo_path_ready=False,
+                far_end_active_s=0.0,
+                alignment_epoch=self._alignment_epoch,
+                stream_alignment_reset_count=self._reset_count,
+                echo_path_reset_count=self._echo_path_reset_count,
+            )

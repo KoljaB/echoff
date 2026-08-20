@@ -11,13 +11,14 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from echoff import AecCapture, AecConfig, AudioBackendError
+from echoff import AecCapture, AecConfig, AudioBackendError, CaptureStateError
 from echoff.models import AecState, AudioBlock
 
 
 class FakeProcessor:
     def __init__(self) -> None:
         self.reset_count = 0
+        self.echo_path_reset_count = 0
         self.pairs: list[tuple[tuple[float, ...], tuple[float, ...]]] = []
 
     def process_pair(self, reference, microphone):
@@ -26,12 +27,22 @@ class FakeProcessor:
         self.pairs.append((reference_tuple, microphone_tuple))
         return tuple(value * 0.5 for value in microphone_tuple)
 
+    def reset_echo_path(self) -> None:
+        self.echo_path_reset_count += 1
+
     def reset_alignment(self) -> None:
         self.reset_count += 1
+        self.echo_path_reset_count += 1
 
     @property
     def state(self) -> AecState:
-        return AecState(True, 4.0, self.reset_count, self.reset_count)
+        return AecState(
+            echo_path_ready=True,
+            far_end_active_s=4.0,
+            alignment_epoch=self.reset_count,
+            stream_alignment_reset_count=self.reset_count,
+            echo_path_reset_count=self.echo_path_reset_count,
+        )
 
 
 class FakeSource:
@@ -115,6 +126,33 @@ def factory_for(reference_rows, microphone_rows):
 
 
 class AecCaptureTests(unittest.TestCase):
+    def test_echo_path_reset_preserves_capture_alignment(self) -> None:
+        processor = FakeProcessor()
+        events = []
+        capture = AecCapture(
+            processor=processor,
+            source_factory=factory_for([], [])[0],
+            on_event=events.append,
+        )
+        with self.assertRaisesRegex(CaptureStateError, "not running"):
+            capture.reset_echo_path()
+
+        before = capture._aligner.snapshot
+        capture._running = True
+        try:
+            capture.reset_echo_path()
+        finally:
+            capture._running = False
+        after = capture._aligner.snapshot
+
+        self.assertEqual(processor.reset_count, 0)
+        self.assertEqual(processor.echo_path_reset_count, 1)
+        self.assertEqual(after.epoch, before.epoch)
+        self.assertEqual(after.pair_count, before.pair_count)
+        self.assertEqual(capture.status().echo_path_reset_count, 1)
+        self.assertEqual(events[-1].kind, "echo_path_reset")
+        self.assertEqual(events[-1].details["alignment_epoch"], 0)
+
     def test_console_diagnostics_are_visible_by_default_and_can_be_disabled(self) -> None:
         output = StringIO()
         capture = AecCapture(
@@ -127,6 +165,13 @@ class AecCaptureTests(unittest.TestCase):
         self.assertIn("\x1b[91m", rendered)
         self.assertIn("[echoff ERROR]", rendered)
         self.assertIn("live AEC suspended", rendered)
+
+        output = StringIO()
+        with patch.object(output, "isatty", return_value=True), redirect_stderr(output):
+            capture._emit("synchronization_recovered", microphone_sequence=12)
+        rendered = output.getvalue()
+        self.assertNotIn("\x1b[91m", rendered)
+        self.assertIn("[echoff INFO] live AEC synchronization recovered", rendered)
 
         output = StringIO()
         capture = AecCapture(
@@ -352,6 +397,93 @@ class AecCaptureTests(unittest.TestCase):
         self.assertNotIn("synchronization_degraded", [event.kind for event in events])
         self.assertNotIn("synchronization_wait_started", [event.kind for event in events])
         self.assertNotIn("synchronization_wait_ended", [event.kind for event in events])
+
+    def test_three_block_microphone_preroll_is_emitted_without_stale_reference(self) -> None:
+        """A later-starting reference must not deadlock or discard early speech."""
+
+        processor = FakeProcessor()
+        events = []
+        frames = []
+        config = AecConfig(
+            block_duration_s=0.010,
+            pair_tolerance_s=0.005,
+            reference_stall_grace_s=0.060,
+        )
+        capture = AecCapture(
+            config,
+            processor=processor,
+            source_factory=factory_for([], [])[0],
+            on_event=events.append,
+            on_frame=frames.append,
+        )
+        capture._processor = processor
+
+        sample_count = config.block_samples
+        microphone_phase = 4.000
+        reference_phase = microphone_phase + 3 * config.block_duration_s
+        capture._start_processing()
+        try:
+            # Reproduce the hardware startup order from the failing artifact:
+            # the worker first blocks on microphone sequence 0, then both
+            # healthy sources continue queuing while reference sequence 0 maps
+            # to microphone slot 3.
+            capture._enqueue_microphone(
+                AudioBlock(
+                    (200.0,) * sample_count,
+                    microphone_phase,
+                    sequence=0,
+                    callback_monotonic=time.monotonic(),
+                    observed_end_monotonic=microphone_phase,
+                )
+            )
+            time.sleep(0.020)
+            for sequence in range(1, 6):
+                ended = microphone_phase + sequence * config.block_duration_s
+                capture._enqueue_microphone(
+                    AudioBlock(
+                        (200.0 + sequence,) * sample_count,
+                        ended,
+                        sequence=sequence,
+                        callback_monotonic=time.monotonic(),
+                        observed_end_monotonic=ended,
+                    )
+                )
+            for sequence in range(3):
+                ended = reference_phase + sequence * config.block_duration_s
+                capture._enqueue_reference(
+                    AudioBlock(
+                        (100.0 + sequence,) * sample_count,
+                        ended,
+                        sequence=sequence,
+                        callback_monotonic=time.monotonic(),
+                        observed_end_monotonic=ended,
+                    )
+                )
+
+            deadline = time.monotonic() + 0.5
+            while len(frames) < 6 and time.monotonic() < deadline:
+                time.sleep(0.002)
+        finally:
+            capture._stop_processing()
+
+        self.assertEqual(len(frames), 6)
+        self.assertEqual(
+            [frame.microphone_raw[0] for frame in frames],
+            [200.0, 201.0, 202.0, 203.0, 204.0, 205.0],
+        )
+        self.assertEqual(
+            [frame.reference_present for frame in frames],
+            [False, False, False, True, True, True],
+        )
+        self.assertEqual(
+            [pair[0][0] for pair in processor.pairs],
+            [0.0, 0.0, 0.0, 100.0, 101.0, 102.0],
+        )
+        self.assertEqual(capture.status().processed_pair_count, 6)
+        self.assertEqual(capture.status().matched_reference_blocks, 3)
+        self.assertEqual(capture.status().zero_filled_reference_blocks, 3)
+        self.assertEqual(capture.status().synchronization_wait_timeout_count, 0)
+        self.assertNotIn("synchronization_degraded", [event.kind for event in events])
 
     def test_microphone_delay_recovers_losslessly_without_reset(self) -> None:
         processor = FakeProcessor()
@@ -637,7 +769,9 @@ class AecCaptureTests(unittest.TestCase):
         self.assertFalse(capture.status().alignment_locked)
         self.assertIn("capture_ready", [event.kind for event in events])
 
-    def test_late_starting_reference_never_zero_fills_early_microphones(self) -> None:
+    def test_late_starting_reference_emits_early_microphones_without_stale_reference(
+        self,
+    ) -> None:
         factory, _sources = factory_for(
             [(1.0, 0.08), (2.0, 0.10), (3.0, 0.12)],
             [
@@ -650,19 +784,32 @@ class AecCaptureTests(unittest.TestCase):
             ],
         )
         processor = FakeProcessor()
+        frames = []
         capture = AecCapture(
             AecConfig(startup_timeout_s=0.5),
             processor=processor,
             source_factory=factory,
+            on_frame=frames.append,
         )
 
         capture.start()
         capture.stop()
 
-        self.assertFalse(capture.status().alignment_locked)
-        self.assertEqual(processor.pairs, [])
-        self.assertEqual(capture.status().zero_filled_reference_blocks, 0)
-        self.assertEqual(capture.status().shutdown_unpaired_microphone_blocks, 6)
+        self.assertTrue(capture.status().alignment_locked)
+        self.assertEqual(
+            [pair[0][0] for pair in processor.pairs],
+            [0.0, 0.0, 0.0, 1.0, 2.0, 3.0],
+        )
+        self.assertEqual(
+            [pair[1][0] for pair in processor.pairs],
+            [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        )
+        self.assertEqual(
+            [frame.reference_present for frame in frames],
+            [False, False, False, True, True, True],
+        )
+        self.assertEqual(capture.status().zero_filled_reference_blocks, 3)
+        self.assertEqual(capture.status().shutdown_unpaired_microphone_blocks, 0)
 
     def test_reference_callback_is_aligned_while_raw_reference_is_preserved(self) -> None:
         factory, _sources = factory_for(
@@ -683,6 +830,41 @@ class AecCaptureTests(unittest.TestCase):
             self.assertEqual(references, [(1.0, 0.02), (2.0, 0.04), (3.0, 0.06)])
             with wave.open(str(output / "reference_received.wav"), "rb") as source:
                 self.assertEqual(source.getnframes(), 2_880)
+
+    def test_frame_preserves_canonical_and_observed_microphone_times(self) -> None:
+        capture = AecCapture(
+            processor=FakeProcessor(),
+            source_factory=factory_for([], [])[0],
+        )
+        capture._processor = FakeProcessor()
+        frames = []
+        references = []
+        capture.on_frame = frames.append
+        capture.on_reference = lambda samples, ended: references.append(ended)
+        reference = AudioBlock(
+            (1.0,) * 960,
+            10.020,
+            sequence=0,
+            callback_monotonic=10.030,
+            observed_end_monotonic=10.025,
+            timing_valid=True,
+        )
+        microphone = AudioBlock(
+            (0.1,) * 960,
+            10.020,
+            sequence=0,
+            callback_monotonic=10.032,
+            observed_end_monotonic=10.027,
+            timing_valid=True,
+        )
+
+        capture._process_master_slot(reference=reference, microphone=microphone)
+
+        self.assertEqual(references, [10.020])
+        self.assertEqual(frames[0].microphone_ended_monotonic, 10.020)
+        self.assertEqual(frames[0].reference_ended_monotonic, 10.020)
+        self.assertEqual(frames[0].microphone_observed_end_monotonic, 10.027)
+        self.assertEqual(frames[0].reference_observed_end_monotonic, 10.025)
 
     def test_reference_discontinuity_during_joining_never_loops(self) -> None:
         capture = AecCapture(

@@ -519,7 +519,10 @@ class WasapiReferenceSource(_ThreadedSource):
             self.selected_device_index = int(info["index"])
             channels = max(1, int(info.get("maxInputChannels") or 1))
             block_frames = self.config.block_samples
-            callback_frames = block_frames * 5
+            # Keep capture release latency at one AEC block. Five-block (100 ms)
+            # callbacks made downstream endpoint decisions wait as much as 80 ms
+            # after the decisive audio was already captured.
+            callback_frames = block_frames
 
             def decode(packet: _RawCallbackPacket) -> None:
                 discontinuity = self._note_status(packet.status_flags, pyaudio)
@@ -800,7 +803,7 @@ class WasapiMicrophoneSource(_ThreadedSource):
         callback_errors: list[Exception] = []
         try:
             block_frames = self.config.block_samples
-            callback_frames = block_frames * 5
+            callback_frames = block_frames
             info: dict[str, Any] | None = None
             last_open_error: OSError | None = None
 

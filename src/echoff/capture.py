@@ -27,6 +27,7 @@ LOGGER = logging.getLogger(__name__)
 
 _CONSOLE_DIAGNOSTIC_LEVELS = {
     "synchronization_degraded": "ERROR",
+    "synchronization_recovered": "INFO",
     "alignment_realigning": "WARNING",
     "alignment_clock_corrected": "WARNING",
     "reference_source_degraded": "ERROR",
@@ -35,6 +36,7 @@ _CONSOLE_DIAGNOSTIC_LEVELS = {
 }
 _CONSOLE_DIAGNOSTIC_MESSAGES = {
     "synchronization_degraded": "live AEC suspended after synchronization reserve expired",
+    "synchronization_recovered": "live AEC synchronization recovered",
     "alignment_realigning": "capture discontinuity invalidated the reference mapping; realigning",
     "alignment_clock_corrected": "reference clock mapping was corrected",
     "reference_source_degraded": (
@@ -274,6 +276,22 @@ class AecCapture:
         """Number of samples already committed to the confirmed-pair timeline."""
 
         return self._processed_slot_count * self.config.block_samples
+
+    def reset_echo_path(self) -> None:
+        """Cold-start AEC adaptation without disturbing capture alignment."""
+
+        with self._state_lock:
+            if not self._running:
+                raise CaptureStateError("capture is not running")
+            if self._processor is None:
+                raise CaptureStateError("capture processor is not initialized")
+            self._processor.reset_echo_path()
+            state = self._processor.state
+        self._emit(
+            "echo_path_reset",
+            echo_path_reset_count=state.echo_path_reset_count,
+            alignment_epoch=state.alignment_epoch,
+        )
 
     def stop(self, *, error: str | None = None, status_name: str | None = None) -> None:
         with self._state_lock:
@@ -567,6 +585,7 @@ class AecCapture:
             echo_path_quality_ready=processor_state.echo_path_quality_ready,
             echo_suppression_db=processor_state.echo_suppression_db,
             echo_quality_s=processor_state.echo_quality_s,
+            echo_path_reset_count=processor_state.echo_path_reset_count,
             processing_mean_ms=(
                 0.0
                 if self._processed_slot_count <= 0
@@ -732,7 +751,7 @@ class AecCapture:
             line = f"{line} ({details})"
         stream = sys.stderr
         try:
-            if stream.isatty():
+            if stream.isatty() and level in {"ERROR", "WARNING"}:
                 line = f"{_ANSI_BRIGHT_RED}{line}{_ANSI_RESET}"
             print(line, file=stream, flush=True)
         except Exception:
@@ -1195,7 +1214,10 @@ class AecCapture:
                         and hint > slot
                         and (
                             not joining
-                            or hint > slot + self._aligner.JOIN_CONFIRMATIONS - 1
+                            or hint
+                            > slot
+                            + self._aligner.JOIN_HORIZON_BLOCKS
+                            + self._aligner.pending_reference_count
                             or candidate.discontinuity
                         )
                     ):
@@ -1255,6 +1277,27 @@ class AecCapture:
                         slot_hard_discontinuity=slot_hard_discontinuity,
                     )
                     self._process_master_slot(reference=reference, microphone=microphone)
+                    observed_microphone_sequence = None
+                    slot_hard_discontinuity = False
+                    made_progress = True
+                    continue
+
+                # A confirmed initial map can prove that the reference source
+                # started after the microphone. Those leading microphone slots
+                # can never receive a real counterpart: every earlier reference
+                # sequence has already been mapped. Emit them immediately with
+                # an explicit absent/zero far-end channel so early speech is
+                # preserved without pairing it to stale system audio. This is
+                # startup-only; a missing reference after the first real pair
+                # still enters the synchronization reserve below.
+                if (
+                    self._aligner.alignment_ready
+                    and self._aligner.snapshot.pair_count == 0
+                    and reference_slots
+                    and min(reference_slots) > slot
+                ):
+                    microphones.popleft()
+                    self._process_master_slot(reference=None, microphone=microphone)
                     observed_microphone_sequence = None
                     slot_hard_discontinuity = False
                     made_progress = True
@@ -1575,21 +1618,32 @@ class AecCapture:
     def _process_master_slot(
         self,
         *,
-        reference: AudioBlock,
+        reference: AudioBlock | None,
         microphone: AudioBlock,
     ) -> None:
-        """Advance the processed timeline exactly once for one confirmed pair."""
+        """Advance once for a confirmed pair or explicit startup mic-only slot."""
 
         if self._processor is None:  # pragma: no cover - guarded by start
             raise CaptureStateError("AEC processor is not initialized")
         worker_started = time.perf_counter()
-        reference_samples = reference.samples
         microphone_samples = microphone.samples
+        reference_present = reference is not None
+        reference_samples = (
+            reference.samples
+            if reference is not None
+            else (0.0,) * len(microphone_samples)
+        )
         ended = microphone.ended_monotonic
         pair_skew = (
-            self._aligner.event_end(reference) - self._aligner.event_end(microphone)
+            0.0
+            if reference is None
+            else self._aligner.event_end(reference) - self._aligner.event_end(microphone)
         )
-        recovered = self._aligner.note_pair(reference, microphone)
+        recovered = False
+        if reference is None:
+            self._aligner.note_zero_filled_reference(1)
+        else:
+            recovered = self._aligner.note_pair(reference, microphone)
         if recovered:
             self._emit(
                 "alignment_recovered",
@@ -1610,6 +1664,7 @@ class AecCapture:
             echo_path_ready=(
                 processor_state.echo_path_ready
                 and self._aligner.alignment_ready
+                and reference_present
             ),
             far_end_active_s=processor_state.far_end_active_s,
             alignment_epoch=processor_state.alignment_epoch,
@@ -1617,6 +1672,7 @@ class AecCapture:
             echo_path_quality_ready=processor_state.echo_path_quality_ready,
             echo_suppression_db=processor_state.echo_suppression_db,
             echo_quality_s=processor_state.echo_quality_s,
+            echo_path_reset_count=processor_state.echo_path_reset_count,
         )
         self.on_frame(
             AecFrame(
@@ -1627,8 +1683,16 @@ class AecCapture:
                 microphone_ended_monotonic=ended,
                 pair_skew_s=pair_skew,
                 state=state,
-                reference_present=True,
+                reference_present=reference_present,
                 microphone_present=True,
+                reference_observed_end_monotonic=(
+                    reference.observed_end_monotonic
+                    if reference is not None and reference.timing_valid
+                    else None
+                ),
+                microphone_observed_end_monotonic=(
+                    microphone.observed_end_monotonic if microphone.timing_valid else None
+                ),
             )
         )
         worker_elapsed = time.perf_counter() - worker_started

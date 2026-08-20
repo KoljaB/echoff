@@ -44,11 +44,17 @@ The mapped time is evidence only: received sample count determines block sequenc
 and a timestamp jump cannot create, remove, or duplicate samples.
 
 Startup requires three consecutive compatible observations. The resulting
-sequence offset remains authoritative throughout the epoch. When either
-expected head is missing, one explicit synchronization episode starts at the
-worker's first observation and buffers both directions for up to the configured
-reserve (3 seconds by default). Arrival inside the reserve drains all confirmed
-pairs in order without zero-fill, payload retirement, mapping loss, or APM reset.
+sequence offset remains authoritative throughout the epoch. If it proves that
+reference capture began within the supported startup horizon after microphone
+capture, the leading microphone slots are processed with a zero far-end channel
+and emitted with `reference_present=False`. This preserves the microphone
+payload without inventing stale reference audio and is counted by
+`zero_filled_reference_blocks`. Once the first real pair has been processed,
+when either expected head is missing, one explicit synchronization episode
+starts at the worker's first observation and buffers both directions for up to
+the configured reserve (15 seconds by default). Arrival inside the reserve
+drains all confirmed pairs in order without zero-fill, payload retirement,
+mapping loss, or APM reset.
 
 After lock, timestamp residuals and gradual device-clock drift are telemetry;
 they do not change pair identity. A source failure or expired reserve enters an
@@ -87,9 +93,12 @@ seconds of paired reference frames with RMS at or above 0.001. It then requires
 a rolling one-second raw-to-clean microphone reduction of at least 10 dB to
 remain true for 250 ms before readiness latches. The raw microphone must also
 have enough exposure to make that reduction meaningful. Silence and unpaired
-startup/shutdown frames do not advance the gate. An explicit processor
-`reset_alignment()` starts a cold epoch. Same-epoch waits and recovery do not
-reset APM, although degraded alignment gates the public readiness state false.
+startup/shutdown frames do not advance the gate. `reset_echo_path()` recreates
+APM and restarts this quality gate without changing stream alignment or queued
+paired samples. `reset_alignment()` does the same cold start while also opening
+a new alignment epoch and clearing adapter tails. Same-epoch waits and recovery
+do not reset APM automatically, although degraded alignment gates the public
+readiness state false.
 
 This is a signal-derived state, not an application policy. Applications decide
 whether to defer VAD or barge-in while the path is cold and must still validate

@@ -271,7 +271,7 @@ class WindowsBackendUnitTests(unittest.TestCase):
         assert module.audio.open_kwargs is not None
         self.assertFalse(module.audio.open_kwargs["start"])
         self.assertIn("stream_callback", module.audio.open_kwargs)
-        self.assertEqual(module.audio.open_kwargs["frames_per_buffer"], 4_800)
+        self.assertEqual(module.audio.open_kwargs["frames_per_buffer"], 960)
 
     def test_microphone_keeps_audio_when_portaudio_timestamp_moves_backwards(self) -> None:
         payload = array("h", [8192] * 960).tobytes()
@@ -353,7 +353,7 @@ class WindowsBackendUnitTests(unittest.TestCase):
         self.assertEqual(source.device_block_count, 1)
         self.assertEqual(source.synthetic_silence_block_count, 0)
         assert module.audio.open_kwargs is not None
-        self.assertEqual(module.audio.open_kwargs["frames_per_buffer"], 4_800)
+        self.assertEqual(module.audio.open_kwargs["frames_per_buffer"], 960)
 
     def test_100ms_microphone_callback_splits_into_five_ordered_blocks(self) -> None:
         pcm = array("h")
@@ -391,7 +391,7 @@ class WindowsBackendUnitTests(unittest.TestCase):
         self.assertEqual(source.callback_payload_frame_count, 4_800)
         self.assertEqual(source.device_block_count, 5)
         assert module.audio.open_kwargs is not None
-        self.assertEqual(module.audio.open_kwargs["frames_per_buffer"], 4_800)
+        self.assertEqual(module.audio.open_kwargs["frames_per_buffer"], 960)
 
     def test_callback_status_preserves_current_payload_and_reports_discontinuity(self) -> None:
         payload = array("h", [0] * 960).tobytes()

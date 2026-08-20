@@ -25,7 +25,7 @@ class AecConfig:
     pair_tolerance_s: float = 0.010
     # Exceptional synchronization reserve. It begins when the pairing worker
     # first observes an unmatched head and adds no normal-path latency.
-    reference_stall_grace_s: float = 3.0
+    reference_stall_grace_s: float = 15.0
     queue_fatal_s: float = 15.0
     startup_timeout_s: float = 3.0
     echo_path_warmup_s: float = 7.5

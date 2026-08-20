@@ -30,7 +30,7 @@ capture emits 20 ms blocks (960 samples) by default.
 | `high_pass_filter` | `True` | Enable WebRTC high-pass filtering |
 | `automatic_gain_control` | `False` | Enable WebRTC AGC; off by default to avoid changing level policy silently |
 | `pair_tolerance_s` | `0.010` | Tolerance for startup/recovery timing evidence; no more than half a capture block |
-| `reference_stall_grace_s` | `3.0` | Symmetric exceptional reserve for either temporarily late source; starts when the worker first observes an unmatched head |
+| `reference_stall_grace_s` | `15.0` | Symmetric exceptional reserve for either temporarily late source; starts when the worker first observes an unmatched head |
 | `queue_fatal_s` | `15.0` | Backlog duration that becomes a fatal health error |
 | `startup_timeout_s` | `3.0` | Maximum wait for the first aligned pair |
 | `echo_path_warmup_s` | `7.5` | Minimum paired active far-end time before readiness |
@@ -88,6 +88,9 @@ down audio processing.
 - `start() -> AecCapture`: single-use startup; waits for initial source audio,
   not necessarily an aligned pair.
 - `stop(error=None, status_name=None)`: idempotent cleanup and finalization.
+- `reset_echo_path()`: atomically recreates the adaptive AEC filter while
+  preserving capture alignment, queues, and the processed-sample timeline.
+  Call it only at an application-owned conversational boundary.
 - `status() -> CaptureStatus`: immutable current snapshot.
 - `raise_if_failed()`: records source failures as degraded status/events and
   raises on processing/callback failure or an unsafe fatal backlog.
@@ -119,7 +122,8 @@ explicit degraded status and telemetry.
 `AecState` contains `echo_path_ready`, cumulative `far_end_active_s` for the
 current epoch, `echo_path_quality_ready`, the latest `echo_suppression_db`,
 consecutive `echo_quality_s`, `alignment_epoch`, and
-`stream_alignment_reset_count`.
+`stream_alignment_reset_count`. `echo_path_reset_count` counts adaptive-filter
+cold starts, including those caused by stream realignment.
 
 ## `CaptureStatus`
 
@@ -135,7 +139,8 @@ consecutive `echo_quality_s`, `alignment_epoch`, and
   anomaly counters;
 - queues/timeline: captured audio seconds, current queue seconds, callback
   packet/payload totals, queue high-water/age, enqueue time, and timeline drift;
-- AEC: readiness, active far-end seconds, reset count; and
+- AEC: readiness, active far-end seconds, echo-path reset count, and separate
+  stream-alignment reset count; and
 - processing: mean/max processing milliseconds.
 
 Serialized captures identify `echoff-capture-artifacts-v2`. Echoff is alpha;
@@ -151,13 +156,18 @@ reference = (0.0,) * 480
 microphone = (0.0,) * 480
 processor = WebRtcAecProcessor(AecConfig())
 clean = processor.process_pair(reference, microphone)
-processor.reset_alignment()
+processor.reset_echo_path()  # Keep stream alignment; cold-start adaptation.
+processor.reset_alignment()  # Declare a real stream discontinuity too.
 state = processor.state
 ```
 
 `process_pair()` requires non-empty equal blocks with lengths divisible by 480.
 It submits every reverse frame immediately before the matching microphone frame
 while holding one internal lock, and returns the same sample count.
+`reset_echo_path()` preserves stream alignment and any paired adapter tail;
+`reset_alignment()` starts a new alignment epoch and clears adapter tails.
+The separate streaming adapter requires `reset_echo_path()` to be called when
+no complete reference frame is awaiting its microphone partner.
 
 ## `BufferedWebRtcAecProcessor`
 

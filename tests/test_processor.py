@@ -93,7 +93,7 @@ class WebRtcAecProcessorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "whole 10 ms"):
             processor.process_pair([0.0] * 481, [0.0] * 481)
 
-    def test_warmup_counts_only_paired_active_reference_and_reset_is_cold(self) -> None:
+    def test_warmup_counts_only_paired_active_reference_and_resets_are_cold(self) -> None:
         processor = self.processor(echo_path_warmup_s=3.25)
         silent = [0.0] * 480
         below = [0.00099] * 480
@@ -120,12 +120,24 @@ class WebRtcAecProcessorTests(unittest.TestCase):
         self.assertEqual(processor.state.alignment_epoch, 0)
 
         first_apm = FakeApm.instances[-1]
-        processor.reset_alignment()
+        processor.reset_echo_path()
         self.assertIsNot(FakeApm.instances[-1], first_apm)
+        self.assertFalse(processor.state.echo_path_ready)
+        self.assertEqual(processor.state.far_end_active_s, 0.0)
+        self.assertEqual(processor.state.alignment_epoch, 0)
+        self.assertEqual(processor.state.stream_alignment_reset_count, 0)
+        self.assertEqual(processor.state.echo_path_reset_count, 1)
+        self.assertFalse(processor.state.echo_path_quality_ready)
+        self.assertIsNone(processor.state.echo_suppression_db)
+
+        second_apm = FakeApm.instances[-1]
+        processor.reset_alignment()
+        self.assertIsNot(FakeApm.instances[-1], second_apm)
         self.assertFalse(processor.state.echo_path_ready)
         self.assertEqual(processor.state.far_end_active_s, 0.0)
         self.assertEqual(processor.state.alignment_epoch, 1)
         self.assertEqual(processor.state.stream_alignment_reset_count, 1)
+        self.assertEqual(processor.state.echo_path_reset_count, 2)
         self.assertFalse(processor.state.echo_path_quality_ready)
         self.assertIsNone(processor.state.echo_suppression_db)
 
@@ -235,6 +247,25 @@ class WebRtcAecProcessorTests(unittest.TestCase):
         processor.process_reference([0.2] * 240)
         self.assertEqual(FakeApm.instances[-1].calls, [])
 
+    def test_streaming_echo_path_reset_requires_synchronized_boundary(self) -> None:
+        processor = StreamingWebRtcAecProcessor(
+            AecConfig(),
+            _rtc=FakeRtc,
+            _apm_type=FakeApm,
+        )
+        processor.process_reference([0.2] * 480)
+        current_apm = FakeApm.instances[-1]
+
+        with self.assertRaisesRegex(RuntimeError, "synchronized boundary"):
+            processor.reset_echo_path()
+        self.assertIs(FakeApm.instances[-1], current_apm)
+        self.assertEqual(processor.state.echo_path_reset_count, 0)
+
+        processor.process_microphone([0.1] * 480)
+        processor.reset_echo_path()
+        self.assertIsNot(FakeApm.instances[-1], current_apm)
+        self.assertEqual(processor.state.echo_path_reset_count, 1)
+
     def test_buffered_pairs_interleave_frames_and_flush_exact_tail(self) -> None:
         processor = BufferedWebRtcAecProcessor(
             AecConfig(),
@@ -257,11 +288,32 @@ class WebRtcAecProcessorTests(unittest.TestCase):
             ],
         )
 
+    def test_echo_path_reset_preserves_buffered_pair_tail(self) -> None:
+        processor = BufferedWebRtcAecProcessor(
+            AecConfig(),
+            _rtc=FakeRtc,
+            _apm_type=FakeApm,
+        )
+        self.assertEqual(processor.process_pair([0.2] * 240, [0.1] * 240), ())
+
+        processor.reset_echo_path()
+        output = processor.process_pair([0.2] * 240, [0.1] * 240)
+
+        self.assertEqual(len(output), 480)
+        self.assertEqual(FakeApm.instances[-1].calls, ["reference", "microphone"])
+        self.assertEqual(processor.state.alignment_epoch, 0)
+        self.assertEqual(processor.state.stream_alignment_reset_count, 0)
+        self.assertEqual(processor.state.echo_path_reset_count, 1)
+
     def test_passthrough_processor_returns_microphone_unchanged(self) -> None:
         processor = PassthroughAecProcessor()
         self.assertEqual(processor.process_pair([0.0, 0.0], [0.1, -0.2]), (0.1, -0.2))
+        processor.reset_echo_path()
+        self.assertEqual(processor.state.echo_path_reset_count, 1)
+        self.assertEqual(processor.state.stream_alignment_reset_count, 0)
         processor.reset_alignment()
         self.assertEqual(processor.state.stream_alignment_reset_count, 1)
+        self.assertEqual(processor.state.echo_path_reset_count, 2)
 
 
 if __name__ == "__main__":

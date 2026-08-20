@@ -354,9 +354,20 @@ class AdaptiveReferenceAligner:
             concrete = [candidate for candidate in candidates if candidate is not None]
             offsets = [offset for offset, _residual in concrete]
             residuals = [residual for _offset, residual in concrete]
+            first_mapped = window[0].sequence + offsets[0]
             latest_mapped = window[-1].sequence + offsets[-1]
-            distance = latest_mapped - self._last_microphone_sequence
-            within_horizon = -2 <= distance <= self.JOIN_HORIZON_BLOCKS
+            latest_distance = latest_mapped - self._last_microphone_sequence
+            first_distance = first_mapped - self._last_microphone_sequence
+            # The horizon constrains where the confirmation *window starts*.
+            # Applying it to the final confirmation shortened the permitted
+            # leading-reference startup skew by JOIN_CONFIRMATIONS - 1 blocks
+            # and could make initial alignment circular: the worker could not
+            # map a reference until it advanced the microphone head, but could
+            # not advance that head until a reference was mapped.
+            within_horizon = (
+                latest_distance >= -(self.JOIN_CONFIRMATIONS - 1)
+                and first_distance <= self.JOIN_HORIZON_BLOCKS
+            )
             if (
                 len(set(offsets)) == 1
                 and abs(median(residuals)) <= self.tolerance_s
@@ -382,7 +393,7 @@ class AdaptiveReferenceAligner:
         return AlignmentUpdate(
             mapped=mapped,
             locks_alignment=not was_realigning,
-            starts_reference_grace=distance < 0,
+            starts_reference_grace=latest_distance < 0,
         )
 
     def _mapping_residual(self, block: AudioBlock, offset: int) -> float:
@@ -540,6 +551,11 @@ class AdaptiveReferenceAligner:
 
     def note_late_reference(self) -> None:
         self._late_reference_blocks += 1
+
+    def note_zero_filled_reference(self, count: int) -> None:
+        """Account for emitted microphone slots with no captured far-end block."""
+
+        self._zero_filled_reference_blocks += count
 
     def note_startup_unpaired_reference(self, count: int) -> None:
         """Account for reference pre-roll before the first microphone slot."""

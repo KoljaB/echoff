@@ -138,8 +138,9 @@ count. Echoff instead:
 2. maps each stream's source timing into one local monotonic domain;
 3. establishes one sequence offset at startup and then treats received sample
    order as authoritative;
-4. waits symmetrically for a temporarily late counterpart instead of creating
-   a synthetic slot; and
+4. preserves a proven leading microphone startup prefix with an explicit absent
+   far-end channel, then waits symmetrically for any later missing counterpart;
+   and
 5. submits each reference frame immediately before its matching microphone
    frame.
 
@@ -226,11 +227,15 @@ System output -> platform loopback -> fixed-block queue --+
 Physical mic -> platform capture -> fixed-block queue ----+
 ```
 
-At startup, Echoff uses source timing to establish the sequence mapping.
-After lock, received sample order is authoritative. If either expected head is
-missing, Echoff waits symmetrically for its counterpart instead of creating
-synthetic audio. The configured stall reserve defaults to three seconds and
-adds no normal-path latency.
+At startup, Echoff uses source timing to establish the sequence mapping. If that
+mapping proves that loopback capture began a few blocks after the microphone,
+Echoff emits only that leading microphone prefix with a zero far-end channel and
+sets `AecFrame.reference_present` to `False`; it never substitutes stale system
+audio or discards the microphone payload. Once real paired capture has begun,
+received sample order is authoritative. If either expected head is missing,
+Echoff waits symmetrically for its counterpart instead of creating synthetic
+audio. The configured stall reserve defaults to 15 seconds and adds no
+normal-path latency.
 
 If the reserve expires or a source fails, Echoff marks alignment degraded and
 suspends unsafe paired AEC output. A proven sequence discontinuity opens one new

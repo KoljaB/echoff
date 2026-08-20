@@ -32,6 +32,7 @@ class AecState:
     echo_path_quality_ready: bool = False
     echo_suppression_db: float | None = None
     echo_quality_s: float = 0.0
+    echo_path_reset_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +48,8 @@ class AecFrame:
     state: AecState
     reference_present: bool = True
     microphone_present: bool = True
+    reference_observed_end_monotonic: float | None = None
+    microphone_observed_end_monotonic: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +184,7 @@ class CaptureStatus:
     reference_error: str | None = None
     microphone_error: str | None = None
     error: str | None = None
+    echo_path_reset_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
