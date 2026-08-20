@@ -33,7 +33,8 @@ quiet details remain audible. The computer-audio reference is unmodified.
 
 > **Note:** Echoff 0.3.0 is alpha software. Built-in live capture is
 > hardware-tested on Windows 10/11 and Ubuntu with PipeWire. The macOS capture
-> backend is not implemented.
+> backend is not implemented. Metrics are diagnostics, not a substitute for
+> listening to the raw and AEC tracks on your own hardware.
 
 ## Support at a glance
 
@@ -47,7 +48,7 @@ Python 3.11 or newer is required. See [Platform support](https://github.com/Kolj
 for the exact boundary between portable processing and platform-specific
 capture.
 
-## Three-minute Windows quickstart
+## Windows quickstart
 
 Create an isolated environment and install the published package:
 
@@ -75,6 +76,18 @@ echo-path readiness heuristic sees a sufficiently active, paired echo path.
 Speak during a separate part of the run if you also want to listen for near-end
 speech preservation.
 
+For a repeatable test, provide a known speech WAV. This requires `ffplay`:
+
+```powershell
+.\.venv\Scripts\python.exe -m echoff record `
+  --play-wav C:\audio\known-speech.wav `
+  --repetitions 1
+```
+
+On Windows, a silent output endpoint may produce no WASAPI loopback callbacks.
+Echoff then stops after its synchronization reserve instead of manufacturing a
+fake reference. Play system audio or use `--play-wav` when testing live capture.
+
 The command prints the artifact directory and writes the three tracks to
 compare:
 
@@ -89,6 +102,11 @@ configuration, summary, analysis, and logs. See
 [Capture artifacts](https://github.com/KoljaB/echoff/blob/main/docs/capture-artifacts.md)
 for the complete schema.
 
+A technically clean smoke test has `status: "completed"`, equal frame counts in
+the three primary tracks, and no reported source failure, unsafe overflow, or
+hard discontinuity. AEC effectiveness still requires listening to
+`microphone_raw.wav` and `microphone_aec.wav`.
+
 Listen first to `microphone_raw.wav` and `microphone_aec.wav`. Speaker playback
 should be lower in the AEC track while your own speech remains intelligible.
 The whole-run level difference is only descriptive when real microphone speech
@@ -96,7 +114,7 @@ is present; use a controlled far-end-only window before calling a number echo
 suppression. The [hardware probe guide](https://github.com/KoljaB/echoff/blob/main/docs/hardware-probe.md)
 shows the repeatable path.
 
-## Three-minute Linux quickstart
+## Linux quickstart
 
 Install the PipeWire command-line tools. On Ubuntu:
 
@@ -141,10 +159,9 @@ count. Echoff instead:
 4. retires and counts leading microphone blocks that have no matching reference
    in the processed timeline (`startup_unpaired_microphone_blocks`); when
    artifacts are enabled, their raw payload is preserved in
-   `microphone_received.wav`; then waits symmetrically for any later missing
-   counterpart;
-   and
-5. submits each reference frame immediately before its matching microphone
+   `microphone_received.wav`;
+5. waits symmetrically for any later missing counterpart; and
+6. submits each reference frame immediately before its matching microphone
    frame.
 
 This is the capture-and-alignment layer that a bare AEC wrapper does not
