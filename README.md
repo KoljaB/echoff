@@ -31,7 +31,7 @@ If the player is unavailable, [open the comparison video](https://github.com/use
 The raw-microphone and Echoff-output tracks use the same +8 dB monitor gain so
 quiet details remain audible. The computer-audio reference is unmodified.
 
-> **Note:** Echoff 0.2 is alpha software. Built-in live capture is
+> **Note:** Echoff 0.3.0 is alpha software. Built-in live capture is
 > hardware-tested on Windows 10/11 and Ubuntu with PipeWire. The macOS capture
 > backend is not implemented.
 
@@ -39,9 +39,9 @@ quiet details remain audible. The computer-audio reference is unmodified.
 
 | Platform | Built-in live capture | Processor-only use with aligned PCM |
 |---|---|---|
-| Windows 10/11 | **Supported**: WASAPI loopback + WASAPI microphone, with WDM-KS microphone fallback | Supported |
-| Linux | PipeWire sink monitor + microphone source | Supported |
-| macOS | Not implemented | Designed for application-owned PCM where LiveKit installs; not qualified here |
+| Windows 10/11 | **Supported**: WASAPI loopback reference + WASAPI microphone; optional strict WDM-KS microphone fallback | Supported |
+| Linux | **Supported**: PipeWire sink-monitor reference + ordinary source microphone via `pactl`, `pw-dump`, and `pw-record` | Supported |
+| macOS | No built-in capture backend | Processor-only use with application-owned aligned PCM |
 
 Python 3.11 or newer is required. See [Platform support](https://github.com/KoljaB/echoff/blob/main/docs/platforms.md)
 for the exact boundary between portable processing and platform-specific
@@ -138,8 +138,11 @@ count. Echoff instead:
 2. maps each stream's source timing into one local monotonic domain;
 3. establishes one sequence offset at startup and then treats received sample
    order as authoritative;
-4. preserves a proven leading microphone startup prefix with an explicit absent
-   far-end channel, then waits symmetrically for any later missing counterpart;
+4. retires and counts leading microphone blocks that have no matching reference
+   in the processed timeline (`startup_unpaired_microphone_blocks`); when
+   artifacts are enabled, their raw payload is preserved in
+   `microphone_received.wav`; then waits symmetrically for any later missing
+   counterpart;
    and
 5. submits each reference frame immediately before its matching microphone
    frame.
@@ -201,8 +204,11 @@ applications need a bounded, non-blocking handoff and an explicit overload
 policy; blocking the callback stalls Echoff's pairing thread.
 
 `AecFrame` contains 48 kHz mono floating-point samples in `[-1.0, 1.0]`, the
-matched reference and raw microphone, both timestamps, pair skew, and an AEC
-state snapshot. An `AecCapture` instance is single-use.
+matched reference and raw microphone, canonical processed-timeline end times,
+nullable per-source observed end times, pair skew, and an AEC state snapshot.
+The canonical `reference_ended_monotonic` and `microphone_ended_monotonic` are
+equal for the processed pair; `pair_skew_s` uses observed timing when valid.
+An `AecCapture` instance is single-use.
 
 For an application that already owns aligned PCM:
 
@@ -227,14 +233,14 @@ System output -> platform loopback -> fixed-block queue --+
 Physical mic -> platform capture -> fixed-block queue ----+
 ```
 
-At startup, Echoff uses source timing to establish the sequence mapping. If that
-mapping proves that loopback capture began a few blocks after the microphone,
-Echoff emits only that leading microphone prefix with a zero far-end channel and
-sets `AecFrame.reference_present` to `False`; it never substitutes stale system
-audio or discards the microphone payload. Once real paired capture has begun,
+At startup, Echoff uses source timing to establish the sequence mapping. Leading
+microphone blocks without a matching reference are retired from the processed
+timeline and counted in `startup_unpaired_microphone_blocks`; they never create a
+synthetic reference slot or an `AecFrame`. When artifacts are enabled, the raw
+payload remains in `microphone_received.wav`. Once real paired capture has begun,
 received sample order is authoritative. If either expected head is missing,
 Echoff waits symmetrically for its counterpart instead of creating synthetic
-audio. The configured stall reserve defaults to 15 seconds and adds no
+audio. The configured stall reserve defaults to 3 seconds and adds no
 normal-path latency.
 
 If the reserve expires or a source fails, Echoff marks alignment degraded and

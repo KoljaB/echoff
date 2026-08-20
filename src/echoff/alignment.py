@@ -56,6 +56,7 @@ class AlignmentSnapshot:
     late_reference_blocks: int
     clock_correction_count: int
     startup_unpaired_reference_blocks: int
+    startup_unpaired_microphone_blocks: int
     degraded_unpaired_reference_blocks: int
     degraded_unpaired_microphone_blocks: int
     wait_timeout_unpaired_reference_blocks: int
@@ -104,6 +105,12 @@ class AdaptiveReferenceAligner:
         self._first_reference_observed_end: float | None = None
         self._reference_offset: int | None = None
         self._join_pending: list[AudioBlock] = []
+        # During startup the worker may be blocked on the microphone head while
+        # later, already queued microphone blocks are available.  Keep that
+        # look-ahead separate from source sequence state: observing the tail
+        # would make the eventual head look like a backwards discontinuity.
+        self._join_validation_microphone_sequence: int | None = None
+        self._join_validation_microphone_barrier = False
         self._join_candidates: deque[tuple[int, float]] = deque(
             maxlen=self.JOIN_CONFIRMATIONS
         )
@@ -127,6 +134,7 @@ class AdaptiveReferenceAligner:
         self._shutdown_unpaired_reference_blocks = 0
         self._shutdown_unpaired_microphone_blocks = 0
         self._startup_unpaired_reference_blocks = 0
+        self._startup_unpaired_microphone_blocks = 0
         self._degraded_unpaired_reference_blocks = 0
         self._degraded_unpaired_microphone_blocks = 0
         self._wait_timeout_unpaired_reference_blocks = 0
@@ -146,6 +154,11 @@ class AdaptiveReferenceAligner:
         return float(value)
 
     def observe_microphone(self, block: AudioBlock) -> AlignmentUpdate:
+        # Any queued-tail validation belongs to the previous head observation.
+        # The caller confirms the current queue again before trying to ingest a
+        # reference, so stale look-ahead cannot survive a source transition.
+        self._join_validation_microphone_sequence = None
+        self._join_validation_microphone_barrier = False
         sequence_discontinuity = (
             self._last_microphone_sequence is not None
             and block.sequence != self._last_microphone_sequence + 1
@@ -188,9 +201,7 @@ class AdaptiveReferenceAligner:
         prevent an otherwise healthy capture from establishing its initial map.
         """
 
-        if self._microphone_phase is not None:
-            return True
-        observations: list[float] = []
+        safe_prefix: list[AudioBlock] = []
         previous_sequence: int | None = None
         for index, block in enumerate(pending):
             if index and (
@@ -199,7 +210,17 @@ class AdaptiveReferenceAligner:
                 or block.sequence != previous_sequence + 1
             ):
                 break
+            safe_prefix.append(block)
             previous_sequence = block.sequence
+        self._join_validation_microphone_sequence = (
+            None if not safe_prefix else safe_prefix[-1].sequence
+        )
+        self._join_validation_microphone_barrier = len(safe_prefix) < len(pending)
+
+        if self._microphone_phase is not None:
+            return True
+        observations: list[float] = []
+        for block in safe_prefix:
             observation = block.ended_monotonic - block.sequence * self.block_duration_s
             observations.append(observation)
             if len(observations) < self.PHASE_CONFIRMATIONS:
@@ -237,6 +258,8 @@ class AdaptiveReferenceAligner:
             self._reference_offset = None
             self._join_pending.clear()
             self._join_candidates.clear()
+            self._join_validation_microphone_sequence = None
+            self._join_validation_microphone_barrier = False
             self._correction_window.clear()
             self._pair_skew_baseline.clear()
             self._pair_skew_target = None
@@ -342,8 +365,18 @@ class AdaptiveReferenceAligner:
         return int(block.sequence + offset)
 
     def _try_join(self) -> AlignmentUpdate:
-        if self._microphone_phase is None or self._last_microphone_sequence is None:
+        if self._microphone_phase is None:
             return AlignmentUpdate()
+        validation_microphone_sequence = self._join_validation_microphone_sequence
+        if validation_microphone_sequence is None:
+            if self._join_validation_microphone_barrier:
+                return AlignmentUpdate()
+            validation_microphone_sequence = self._last_microphone_sequence
+        if validation_microphone_sequence is None:
+            return AlignmentUpdate()
+        lower_bound_microphone_sequence = self._last_microphone_sequence
+        if lower_bound_microphone_sequence is None:
+            lower_bound_microphone_sequence = validation_microphone_sequence
         selected_offset: int | None = None
         selected_start = 0
         for start in range(0, len(self._join_pending) - self.JOIN_CONFIRMATIONS + 1):
@@ -356,8 +389,8 @@ class AdaptiveReferenceAligner:
             residuals = [residual for _offset, residual in concrete]
             first_mapped = window[0].sequence + offsets[0]
             latest_mapped = window[-1].sequence + offsets[-1]
-            latest_distance = latest_mapped - self._last_microphone_sequence
-            first_distance = first_mapped - self._last_microphone_sequence
+            latest_distance = latest_mapped - lower_bound_microphone_sequence
+            first_distance = first_mapped - validation_microphone_sequence
             # The horizon constrains where the confirmation *window starts*.
             # Applying it to the final confirmation shortened the permitted
             # leading-reference startup skew by JOIN_CONFIRMATIONS - 1 blocks
@@ -366,12 +399,21 @@ class AdaptiveReferenceAligner:
             # not advance that head until a reference was mapped.
             within_horizon = (
                 latest_distance >= -(self.JOIN_CONFIRMATIONS - 1)
-                and first_distance <= self.JOIN_HORIZON_BLOCKS
+                and first_distance
+                <= (
+                    0
+                    if self._join_validation_microphone_barrier
+                    else self.JOIN_HORIZON_BLOCKS
+                )
             )
             if (
                 len(set(offsets)) == 1
                 and abs(median(residuals)) <= self.tolerance_s
                 and within_horizon
+                and (
+                    not self._join_validation_microphone_barrier
+                    or latest_mapped <= validation_microphone_sequence
+                )
             ):
                 selected_offset = offsets[0]
                 selected_start = start
@@ -387,6 +429,8 @@ class AdaptiveReferenceAligner:
         )
         self._join_pending.clear()
         self._join_candidates.clear()
+        self._join_validation_microphone_sequence = None
+        self._join_validation_microphone_barrier = False
         was_realigning = self._hard_episode_open
         self._mode = AlignmentMode.RECOVERY if was_realigning else AlignmentMode.LOCKED
         self._recovery_good = 0
@@ -562,6 +606,11 @@ class AdaptiveReferenceAligner:
 
         self._startup_unpaired_reference_blocks += count
 
+    def note_startup_unpaired_microphone(self, count: int) -> None:
+        """Account for microphone pre-roll before the first reference slot."""
+
+        self._startup_unpaired_microphone_blocks += count
+
     def note_shutdown_unpaired(self, source: str, count: int) -> None:
         if source == "reference":
             self._shutdown_unpaired_reference_blocks += count
@@ -581,6 +630,20 @@ class AdaptiveReferenceAligner:
     @property
     def pending_reference_count(self) -> int:
         return len(self._join_pending)
+
+    @property
+    def join_validation_microphone_sequence(self) -> int | None:
+        """Newest microphone sequence safe for startup join validation."""
+
+        if self._join_validation_microphone_sequence is not None:
+            return self._join_validation_microphone_sequence
+        return self._last_microphone_sequence
+
+    @property
+    def join_validation_microphone_barrier(self) -> bool:
+        """Whether queued microphone look-ahead stopped at an epoch barrier."""
+
+        return self._join_validation_microphone_barrier
 
     @property
     def reference_offset(self) -> int | None:
@@ -615,6 +678,9 @@ class AdaptiveReferenceAligner:
             clock_correction_count=self._clock_correction_count,
             startup_unpaired_reference_blocks=(
                 self._startup_unpaired_reference_blocks
+            ),
+            startup_unpaired_microphone_blocks=(
+                self._startup_unpaired_microphone_blocks
             ),
             degraded_unpaired_reference_blocks=(
                 self._degraded_unpaired_reference_blocks

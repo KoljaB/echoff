@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import math
+import sys
 import threading
 import time
 import unittest
 from array import array
 from dataclasses import dataclass
 from itertools import pairwise
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from echoff import AecConfig, AudioBackendError
 from echoff.backends.windows import (
     WasapiMicrophoneSource,
     WasapiReferenceSource,
+    _native_callback_frames,
     _SharedWasapiContext,
+    list_windows_devices,
 )
 
 
@@ -83,6 +87,103 @@ class _FakeCallbackStream:
         pass
 
 
+class _StartFailingCallbackStream(_FakeCallbackStream):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.stop_calls = 0
+        self.closed = False
+
+    def start_stream(self) -> None:
+        raise OSError("native start failed")
+
+    def stop_stream(self) -> None:
+        self.stop_calls += 1
+        raise OSError("stop inactive")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _DelayedStartCallbackStream(_FakeCallbackStream):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.start_entered = threading.Event()
+        self.release_start = threading.Event()
+
+    def start_stream(self) -> None:
+        self.start_entered.set()
+        if not self.release_start.wait(1.0):
+            raise OSError("test did not release delayed start")
+        self.active = True
+
+
+class _PartialStartFailingCallbackStream(_FakeCallbackStream):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.stop_calls = 0
+        self.close_active = False
+
+    def start_stream(self) -> None:
+        self.active = True
+        raise RuntimeError("partial native start failed")
+
+    def stop_stream(self) -> None:
+        self.stop_calls += 1
+        self.active = False
+
+    def close(self) -> None:
+        self.close_active = self.active
+
+
+class _UnknownActivityPartialStartCallbackStream(_FakeCallbackStream):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.stop_calls = 0
+        self.close_active = None
+
+    def start_stream(self) -> None:
+        self.active = True
+        raise RuntimeError("partial native start with unknown activity")
+
+    def is_active(self) -> bool:
+        raise RuntimeError("native activity probe unavailable")
+
+    def stop_stream(self) -> None:
+        self.stop_calls += 1
+        self.active = False
+
+    def close(self) -> None:
+        self.close_active = self.active
+
+
+class _ShutdownOverflowCallbackStream(_FakeCallbackStream):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.stop_calls = 0
+        self.closed = False
+
+    def start_stream(self) -> None:
+        if self.callback is None:
+            raise RuntimeError("callback was not installed")
+        self.active = True
+
+    def stop_stream(self) -> None:
+        self.stop_calls += 1
+        assert self.callback is not None
+        payload = array("h", [0] * 4_800).tobytes()
+        time_info = {
+            "input_buffer_adc_time": 1.0,
+            "current_time": 1.0,
+            "output_buffer_dac_time": 0.0,
+        }
+        self.callback(payload, 4_800, time_info, 0)
+        self.callback(payload, 4_800, time_info, 0)
+        self.active = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class _FakePyAudio:
     def __init__(self, stream: _FakeCallbackStream) -> None:
         self.stream = stream
@@ -145,6 +246,128 @@ class _AlwaysFailingPyAudioModule(_ReinitializingPyAudioModule):
         return manager
 
 
+class _GenericFailingPyAudioModule(_ReinitializingPyAudioModule):
+    def PyAudio(self) -> _FakePyAudio:
+        manager = _FakePyAudio(self.audio.stream)
+        self.managers.append(manager)
+
+        def fail_open(**_kwargs: object) -> _FakeCallbackStream:
+            raise RuntimeError("generic PortAudio open failure")
+
+        manager.open = fail_open  # type: ignore[method-assign]
+        return manager
+
+
+class _FakeSoundDeviceStream:
+    def __init__(self, owner, **kwargs: object) -> None:
+        self.owner = owner
+        self.kwargs = kwargs
+        self.active = False
+        if owner.open_error is not None:
+            raise owner.open_error
+
+    def start(self) -> None:
+        if self.owner.start_error is not None:
+            raise self.owner.start_error
+        self.active = True
+        if self.owner.partial_start_error is not None:
+            raise self.owner.partial_start_error
+        self.owner.started.set()
+        if self.owner.emit_frames:
+            self.owner.callback_thread_id = threading.get_ident()
+            callback = self.kwargs["callback"]
+            callback(
+                array("f", [0.25] * self.owner.emit_frames),
+                self.owner.emit_frames,
+                SimpleNamespace(inputBufferAdcTime=1.0, currentTime=1.0),
+                None,
+            )
+        if self.owner.stop_after_start:
+            self.active = False
+
+    def stop(self) -> None:
+        self.active = False
+        self.owner.stopped = True
+
+    def close(self) -> None:
+        self.owner.closed = True
+
+
+class _UnknownActivityPartialStartSoundDeviceStream:
+    def __init__(self, owner, **kwargs: object) -> None:
+        self.owner = owner
+        self.kwargs = kwargs
+        self._active = False
+        self.stop_calls = 0
+        self.close_active = None
+
+    @property
+    def active(self) -> bool:
+        raise RuntimeError("WDM-KS activity probe unavailable")
+
+    def start(self) -> None:
+        self._active = True
+        raise RuntimeError("partial WDM-KS start with unknown activity")
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        self._active = False
+
+    def close(self) -> None:
+        self.close_active = self._active
+
+
+class _FakeSoundDevice:
+    class CallbackAbort(Exception):
+        pass
+
+    def __init__(
+        self,
+        *,
+        open_error: Exception | None = None,
+        start_error: Exception | None = None,
+        partial_start_error: Exception | None = None,
+        device_name: str = "Fake microphone",
+        emit_frames: int = 0,
+        stop_after_start: bool = False,
+    ) -> None:
+        self.open_error = open_error
+        self.start_error = start_error
+        self.partial_start_error = partial_start_error
+        self.started = threading.Event()
+        self.stopped = False
+        self.closed = False
+        self.device_name = device_name
+        self.emit_frames = emit_frames
+        self.stop_after_start = stop_after_start
+        self.callback_thread_id: int | None = None
+        self.streams = []
+
+    def query_hostapis(self):
+        return [{"name": "Windows WASAPI"}, {"name": "Windows WDM-KS"}]
+
+    def query_devices(self):
+        return [
+            {
+                "name": self.device_name,
+                "hostapi": 1,
+                "max_input_channels": 1,
+            }
+        ]
+
+    def InputStream(self, **kwargs: object):
+        stream = _FakeSoundDeviceStream(self, **kwargs)
+        self.streams.append(stream)
+        return stream
+
+
+class _UnknownActivityPartialStartSoundDevice(_FakeSoundDevice):
+    def InputStream(self, **kwargs: object):
+        stream = _UnknownActivityPartialStartSoundDeviceStream(self, **kwargs)
+        self.streams.append(stream)
+        return stream
+
+
 class WindowsBackendUnitTests(unittest.TestCase):
     def test_shared_context_serializes_portaudio_lifecycle_on_one_thread(self) -> None:
         module = _FakePyAudioModule(_FakeCallbackStream([]))
@@ -179,6 +402,96 @@ class WindowsBackendUnitTests(unittest.TestCase):
         self.assertAlmostEqual(source.callback_timeline_drift_s, 0.020, places=9)
         self.assertAlmostEqual(source.callback_timeline_drift_max_s, 0.020, places=9)
 
+    def test_callback_queue_overflow_is_bounded_and_explicit(self) -> None:
+        source = WasapiMicrophoneSource(
+            AecConfig(queue_fatal_s=0.020),
+            lambda _block: None,
+        )
+        payload = array("h", [0] * 960).tobytes()
+        time_info = {"input_buffer_adc_time": 1.0, "current_time": 1.0}
+
+        source._enqueue_callback_packet(payload, 960, time_info, 0)
+        with self.assertRaisesRegex(AudioBackendError, "fatal capacity"):
+            source._enqueue_callback_packet(payload, 960, time_info, 0)
+
+        self.assertEqual(source._callback_queue.qsize(), 1)
+        self.assertEqual(source.callback_packet_count, 1)
+        self.assertEqual(source.callback_queue_overflow_count, 1)
+
+    def test_native_callback_cadence_and_queue_limit_are_duration_based(self) -> None:
+        for block_duration_s in (0.010, 0.020, 0.030):
+            with self.subTest(block_duration_s=block_duration_s):
+                config = AecConfig(
+                    block_duration_s=block_duration_s,
+                    pair_tolerance_s=0.004,
+                    queue_fatal_s=0.100,
+                )
+                source = WasapiMicrophoneSource(config, lambda _block: None)
+                self.assertEqual(_native_callback_frames(config), 4_800)
+                self.assertEqual(source._callback_queue.maxsize, 1)
+                source._enqueue_callback_packet(
+                    array("h", [0] * 4_800).tobytes(),
+                    4_800,
+                    {"input_buffer_adc_time": 1.0, "current_time": 1.0},
+                    0,
+                )
+                diagnostics = source.diagnostics_snapshot()
+                self.assertEqual(
+                    diagnostics["callback_queue_high_watermark_blocks"],
+                    math.ceil(0.100 / block_duration_s),
+                )
+                self.assertEqual(
+                    diagnostics["callback_queue_high_watermark_packets"],
+                    1,
+                )
+
+    def test_wdmks_fallback_rejects_an_empty_normalized_device_name(self) -> None:
+        source = WasapiMicrophoneSource(AecConfig(), lambda _block: None)
+        sounddevice = _FakeSoundDevice(device_name="Microphone 2")
+
+        with self.assertRaisesRegex(AudioBackendError, "could not prove"):
+            source._select_wdmks_fallback_device(
+                sounddevice,
+                "Jabra microphone",
+            )
+
+    def test_wdmks_fallback_requires_exact_normalized_physical_name(self) -> None:
+        source = WasapiMicrophoneSource(AecConfig(), lambda _block: None)
+        sounddevice = _FakeSoundDevice(device_name="USB Headset")
+
+        with self.assertRaisesRegex(AudioBackendError, "could not prove"):
+            source._select_wdmks_fallback_device(sounddevice, "USB Microphone")
+
+    def test_wdmks_fallback_accepts_one_exact_normalized_physical_name(self) -> None:
+        source = WasapiMicrophoneSource(AecConfig(), lambda _block: None)
+        sounddevice = _FakeSoundDevice(device_name="USB Microphone")
+
+        index, info = source._select_wdmks_fallback_device(
+            sounddevice,
+            "USB Microphone",
+        )
+
+        self.assertEqual(index, 0)
+        self.assertEqual(info["name"], "USB Microphone")
+
+    def test_wdmks_fallback_refuses_unknown_physical_names(self) -> None:
+        source = WasapiMicrophoneSource(AecConfig(), lambda _block: None)
+        sounddevice = _FakeSoundDevice(device_name=None)  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(AudioBackendError, "could not prove"):
+            source._select_wdmks_fallback_device(sounddevice, None)
+
+    def test_wdmks_fallback_refuses_empty_or_unnamed_physical_candidates(self) -> None:
+        source = WasapiMicrophoneSource(AecConfig(), lambda _block: None)
+        for device_name in ("", "Unknown Microphone", "Unnamed Microphone"):
+            with self.subTest(device_name=device_name):
+                sounddevice = _FakeSoundDevice(device_name=device_name)
+                with self.assertRaisesRegex(AudioBackendError, "could not prove"):
+                    source._select_wdmks_fallback_device(
+                        sounddevice,
+                        device_name,
+                    )
+
     def test_microphone_retries_once_with_a_fresh_portaudio_context(self) -> None:
         payload = array("h", [8192] * 960).tobytes()
         stream = _FakeCallbackStream([_CallbackResponse(payload, 960, 10.0)])
@@ -209,6 +522,9 @@ class WindowsBackendUnitTests(unittest.TestCase):
         assert module.managers[1].open_kwargs is not None
         self.assertEqual(module.managers[1].open_kwargs["input_device_index"], 11)
         self.assertEqual(len(received), 1)
+        self.assertFalse(source.fallback_used)
+        self.assertEqual(len(source.backend_attempt_errors), 1)
+        self.assertIn("WASAPI open attempt 1", source.backend_attempt_errors[0])
 
     def test_microphone_never_opens_more_than_twice(self) -> None:
         module = _AlwaysFailingPyAudioModule(_FakeCallbackStream([]))
@@ -224,6 +540,399 @@ class WindowsBackendUnitTests(unittest.TestCase):
             source.start()
 
         self.assertEqual(len(module.managers), 2)
+        self.assertTrue(
+            all(manager.terminated_thread_id is not None for manager in module.managers)
+        )
+        self.assertFalse(source.fallback_used)
+        self.assertEqual(len(source.backend_attempt_errors), 2)
+
+    def test_start_failure_is_not_masked_by_inactive_stream_cleanup(self) -> None:
+        for source_class in (WasapiReferenceSource, WasapiMicrophoneSource):
+            with self.subTest(source=source_class.__name__):
+                stream = _StartFailingCallbackStream()
+                module = _FakePyAudioModule(stream)
+                source = source_class(AecConfig(), lambda _block: None)
+                with patch("echoff.backends.windows._load_pyaudio", return_value=module):
+                    source.start()
+                    source.activate()
+                    deadline = time.monotonic() + 1.0
+                    while source.error is None and time.monotonic() < deadline:
+                        time.sleep(0.010)
+                    source.stop()
+
+                self.assertIsNotNone(source.error)
+                self.assertIn("failed to start WASAPI", str(source.error))
+                self.assertNotIn("stop inactive", str(source.error))
+                self.assertEqual(stream.stop_calls, 0)
+                self.assertTrue(stream.closed)
+                self.assertIsNotNone(module.audio.terminated_thread_id)
+
+    def test_partially_started_wasapi_stream_is_stopped_before_close(self) -> None:
+        stream = _PartialStartFailingCallbackStream()
+        module = _FakePyAudioModule(stream)
+        source = WasapiMicrophoneSource(AecConfig(), lambda _block: None)
+
+        with patch("echoff.backends.windows._load_pyaudio", return_value=module):
+            source.start()
+            source.activate()
+            deadline = time.monotonic() + 1.0
+            while source.error is None and time.monotonic() < deadline:
+                time.sleep(0.010)
+            source.stop()
+
+        self.assertIsNotNone(source.error)
+        self.assertIn("partial native start failed", str(source.error))
+        self.assertEqual(stream.stop_calls, 1)
+        self.assertFalse(stream.close_active)
+
+    def test_unknown_wasapi_activity_after_partial_start_stops_before_close(self) -> None:
+        for source_class in (WasapiReferenceSource, WasapiMicrophoneSource):
+            with self.subTest(source=source_class.__name__):
+                stream = _UnknownActivityPartialStartCallbackStream()
+                module = _FakePyAudioModule(stream)
+                source = source_class(AecConfig(), lambda _block: None)
+
+                with patch("echoff.backends.windows._load_pyaudio", return_value=module):
+                    source.start()
+                    source.activate()
+                    deadline = time.monotonic() + 1.0
+                    while source.error is None and time.monotonic() < deadline:
+                        time.sleep(0.010)
+                    source.stop()
+
+                self.assertIsNotNone(source.error)
+                self.assertIn("partial native start with unknown activity", str(source.error))
+                self.assertEqual(stream.stop_calls, 1)
+                self.assertFalse(stream.close_active)
+
+    def test_active_event_is_published_after_selected_metadata(self) -> None:
+        stream = _DelayedStartCallbackStream()
+        module = _FakePyAudioModule(stream)
+        source = WasapiMicrophoneSource(AecConfig(), lambda _block: None)
+
+        with patch("echoff.backends.windows._load_pyaudio", return_value=module):
+            source.start()
+            source.activate()
+            self.assertTrue(stream.start_entered.wait(1.0))
+            self.assertFalse(source.active_event.is_set())
+            self.assertEqual(source.backend_name, "uninitialized")
+            self.assertIsNone(source.selected_device_name)
+            stream.release_start.set()
+            self.assertTrue(source.active_event.wait(1.0))
+            self.assertEqual(source.backend_name, "pyaudiowpatch_wasapi_microphone")
+            self.assertEqual(source.selected_device_name, "Fake microphone")
+            source.stop()
+
+    def test_wdmks_fallback_is_selected_only_after_successful_start(self) -> None:
+        module = _AlwaysFailingPyAudioModule(_FakeCallbackStream([]))
+        sounddevice = _FakeSoundDevice()
+        source = WasapiMicrophoneSource(AecConfig(), lambda _block: None)
+
+        with (
+            patch("echoff.backends.windows._load_pyaudio", return_value=module),
+            patch.dict(sys.modules, {"sounddevice": sounddevice}),
+        ):
+            source.start()
+            self.assertEqual(source.backend_name, "uninitialized")
+            self.assertIsNone(source.selected_device_name)
+            self.assertIsNone(source.selected_device_index)
+            source.activate()
+            self.assertTrue(sounddevice.started.wait(1.0))
+            self.assertEqual(source.backend_name, "sounddevice_wdmks_microphone")
+            self.assertEqual(source.selected_device_name, "Fake microphone")
+            self.assertEqual(source.selected_device_index, 0)
+            self.assertTrue(source.fallback_used)
+            self.assertEqual(len(source.backend_attempt_errors), 2)
+            self.assertTrue(
+                all(
+                    message.startswith("WASAPI open attempt")
+                    for message in source.backend_attempt_errors
+                )
+            )
+            source.stop()
+
+        self.assertTrue(sounddevice.stopped)
+        self.assertTrue(sounddevice.closed)
+
+    def test_generic_portaudio_open_errors_are_recorded_before_fallback(self) -> None:
+        module = _GenericFailingPyAudioModule(_FakeCallbackStream([]))
+        sounddevice = _FakeSoundDevice()
+        source = WasapiMicrophoneSource(AecConfig(), lambda _block: None)
+
+        with (
+            patch("echoff.backends.windows._load_pyaudio", return_value=module),
+            patch.dict(sys.modules, {"sounddevice": sounddevice}),
+        ):
+            source.start()
+            source.activate()
+            self.assertTrue(source.active_event.wait(1.0))
+            source.stop()
+
+        self.assertTrue(source.fallback_used)
+        self.assertEqual(len(source.backend_attempt_errors), 2)
+        self.assertTrue(
+            all("generic PortAudio open failure" in item for item in source.backend_attempt_errors)
+        )
+
+    def test_partially_started_wdmks_stream_is_stopped_before_close(self) -> None:
+        module = _AlwaysFailingPyAudioModule(_FakeCallbackStream([]))
+        sounddevice = _FakeSoundDevice(
+            partial_start_error=RuntimeError("partial WDM start failure")
+        )
+        source = WasapiMicrophoneSource(AecConfig(), lambda _block: None)
+
+        with (
+            patch("echoff.backends.windows._load_pyaudio", return_value=module),
+            patch.dict(sys.modules, {"sounddevice": sounddevice}),
+        ):
+            source.start()
+            source.activate()
+            deadline = time.monotonic() + 1.0
+            while source.error is None and time.monotonic() < deadline:
+                time.sleep(0.010)
+            source.stop()
+
+        self.assertIsNotNone(source.error)
+        self.assertIn("partial WDM start failure", str(source.error))
+        self.assertTrue(sounddevice.stopped)
+        self.assertTrue(sounddevice.closed)
+
+    def test_unknown_wdmks_activity_after_partial_start_stops_before_close(self) -> None:
+        module = _AlwaysFailingPyAudioModule(_FakeCallbackStream([]))
+        sounddevice = _UnknownActivityPartialStartSoundDevice()
+        source = WasapiMicrophoneSource(AecConfig(), lambda _block: None)
+
+        with (
+            patch("echoff.backends.windows._load_pyaudio", return_value=module),
+            patch.dict(sys.modules, {"sounddevice": sounddevice}),
+        ):
+            source.start()
+            source.activate()
+            deadline = time.monotonic() + 1.0
+            while source.error is None and time.monotonic() < deadline:
+                time.sleep(0.010)
+            source.stop()
+
+        stream = sounddevice.streams[0]
+        self.assertIsNotNone(source.error)
+        self.assertIn("partial WDM-KS start with unknown activity", str(source.error))
+        self.assertEqual(stream.stop_calls, 1)
+        self.assertFalse(stream.close_active)
+
+    def test_shutdown_callback_queue_overflow_is_not_completed(self) -> None:
+        stream = _ShutdownOverflowCallbackStream()
+        module = _FakePyAudioModule(stream)
+        source = WasapiMicrophoneSource(
+            AecConfig(queue_fatal_s=0.020),
+            lambda _block: None,
+        )
+
+        with patch("echoff.backends.windows._load_pyaudio", return_value=module):
+            source.start()
+            source.activate()
+            self.assertTrue(source.active_event.wait(1.0))
+            source.stop()
+
+        self.assertIsNotNone(source.error)
+        self.assertIn("callback queue exceeded", str(source.error))
+        self.assertEqual(stream.stop_calls, 1)
+        self.assertTrue(stream.closed)
+
+    def test_wdmks_fallback_decodes_off_the_realtime_callback_thread(self) -> None:
+        module = _AlwaysFailingPyAudioModule(_FakeCallbackStream([]))
+        sounddevice = _FakeSoundDevice(emit_frames=4_800)
+        received_threads: list[int] = []
+        received = threading.Event()
+
+        def on_block(_block) -> None:
+            received_threads.append(threading.get_ident())
+            received.set()
+
+        source = WasapiMicrophoneSource(AecConfig(), on_block)
+        with (
+            patch("echoff.backends.windows._load_pyaudio", return_value=module),
+            patch.dict(sys.modules, {"sounddevice": sounddevice}),
+        ):
+            source.start()
+            source.activate()
+            self.assertTrue(source.active_event.wait(1.0))
+            self.assertTrue(received.wait(1.0))
+            source.stop()
+
+        self.assertIsNotNone(sounddevice.callback_thread_id)
+        self.assertTrue(received_threads)
+        self.assertTrue(
+            all(thread_id != sounddevice.callback_thread_id for thread_id in received_threads)
+        )
+        self.assertEqual(source.callback_packet_count, 1)
+        self.assertEqual(source.callback_payload_frame_count, 4_800)
+        self.assertEqual(source.device_block_count, 5)
+
+    def test_wdmks_callback_requested_stop_is_not_classified_as_start_failure(self) -> None:
+        module = _AlwaysFailingPyAudioModule(_FakeCallbackStream([]))
+        sounddevice = _FakeSoundDevice(emit_frames=4_800)
+        received = 0
+
+        def on_block(_block) -> None:
+            nonlocal received
+            received += 1
+            if received == 5:
+                source.stop_event.set()
+
+        source = WasapiMicrophoneSource(AecConfig(), on_block)
+        with (
+            patch("echoff.backends.windows._load_pyaudio", return_value=module),
+            patch.dict(sys.modules, {"sounddevice": sounddevice}),
+        ):
+            source.start()
+            source.activate()
+            deadline = time.monotonic() + 1.0
+            while (
+                source.thread is not None
+                and source.thread.is_alive()
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.010)
+            source.stop()
+
+        self.assertIsNone(source.error)
+        self.assertEqual(received, 5)
+
+    def test_failed_context_release_can_be_retried(self) -> None:
+        class FlakyContext:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def release(self) -> None:
+                self.calls += 1
+                if self.calls == 1:
+                    raise AudioBackendError("control thread still alive")
+
+        context = FlakyContext()
+        source = WasapiMicrophoneSource(
+            AecConfig(),
+            lambda _block: None,
+            _context=context,  # type: ignore[arg-type]
+        )
+
+        with self.assertRaisesRegex(AudioBackendError, "still alive"):
+            source._release_resources()
+        source._release_resources()
+
+        self.assertEqual(context.calls, 2)
+        self.assertTrue(source._resources_released)
+
+    def test_wasapi_host_api_index_zero_is_not_treated_as_missing(self) -> None:
+        class HostZeroAudio:
+            def get_default_wasapi_loopback(self):
+                return {"index": 10}
+
+            def get_default_wasapi_device(self):
+                return {"index": 0}
+
+            def get_host_api_info_by_type(self, _kind):
+                return {"index": 0}
+
+            def get_loopback_device_info_generator(self):
+                return iter(())
+
+            def get_device_count(self):
+                return 1
+
+            def get_device_info_by_index(self, _index):
+                return {
+                    "index": 0,
+                    "name": "Host-zero microphone",
+                    "hostApi": 0,
+                    "maxInputChannels": 1,
+                    "defaultSampleRate": 48_000.0,
+                }
+
+            def terminate(self) -> None:
+                pass
+
+        audio = HostZeroAudio()
+        module = SimpleNamespace(paWASAPI=13, PyAudio=lambda: audio)
+        with patch("echoff.backends.windows._load_pyaudio", return_value=module):
+            devices = list_windows_devices()
+
+        self.assertEqual(len(devices), 1)
+        self.assertEqual(devices[0].index, 0)
+        source = WasapiMicrophoneSource(
+            AecConfig(),
+            lambda _block: None,
+            device="Host-zero",
+        )
+        selected = source._select_device(audio, module)
+        self.assertEqual(selected["index"], 0)
+
+    def test_wdmks_unexpected_inactive_stream_is_a_source_failure(self) -> None:
+        module = _AlwaysFailingPyAudioModule(_FakeCallbackStream([]))
+        sounddevice = _FakeSoundDevice(emit_frames=4_800, stop_after_start=True)
+        source = WasapiMicrophoneSource(AecConfig(), lambda _block: None)
+
+        with (
+            patch("echoff.backends.windows._load_pyaudio", return_value=module),
+            patch.dict(sys.modules, {"sounddevice": sounddevice}),
+        ):
+            source.start()
+            source.activate()
+            deadline = time.monotonic() + 1.0
+            while source.error is None and time.monotonic() < deadline:
+                time.sleep(0.010)
+            source.stop()
+
+        self.assertIsNotNone(source.error)
+        self.assertIn("callback stream stopped", str(source.error))
+
+    def test_failed_wdmks_start_never_claims_selected_backend(self) -> None:
+        module = _AlwaysFailingPyAudioModule(_FakeCallbackStream([]))
+        sounddevice = _FakeSoundDevice(start_error=OSError("host start failed"))
+        source = WasapiMicrophoneSource(AecConfig(), lambda _block: None)
+
+        with (
+            patch("echoff.backends.windows._load_pyaudio", return_value=module),
+            patch.dict(sys.modules, {"sounddevice": sounddevice}),
+        ):
+            source.start()
+            source.activate()
+            deadline = time.monotonic() + 1.0
+            while source.error is None and time.monotonic() < deadline:
+                time.sleep(0.010)
+            source.stop()
+
+        self.assertIsNotNone(source.error)
+        self.assertIn("failed to start WDM-KS", str(source.error))
+        self.assertEqual(source.backend_name, "uninitialized")
+        self.assertIsNone(source.selected_device_name)
+        self.assertIsNone(source.selected_device_index)
+        self.assertFalse(source.fallback_used)
+        self.assertEqual(len(source.backend_attempt_errors), 3)
+        self.assertIn("WDM-KS fallback", source.backend_attempt_errors[-1])
+        self.assertFalse(sounddevice.stopped)
+        self.assertTrue(sounddevice.closed)
+
+    def test_unstarted_shared_source_releases_its_context_owner(self) -> None:
+        module = _AlwaysFailingPyAudioModule(_FakeCallbackStream([]))
+        with patch("echoff.backends.windows._load_pyaudio", return_value=module):
+            context = _SharedWasapiContext.create(2)
+            reference = WasapiReferenceSource(
+                AecConfig(),
+                lambda _block: None,
+                _context=context,
+            )
+            microphone = WasapiMicrophoneSource(
+                AecConfig(allow_wdmks_microphone_fallback=False),
+                lambda _block: None,
+                _context=context,
+            )
+            with self.assertRaisesRegex(AudioBackendError, "fresh-context retry"):
+                microphone.start()
+            microphone.stop()
+            self.assertTrue(context._thread.is_alive())
+            reference.stop()
+
+        self.assertFalse(context._thread.is_alive())
         self.assertTrue(
             all(manager.terminated_thread_id is not None for manager in module.managers)
         )
@@ -271,7 +980,7 @@ class WindowsBackendUnitTests(unittest.TestCase):
         assert module.audio.open_kwargs is not None
         self.assertFalse(module.audio.open_kwargs["start"])
         self.assertIn("stream_callback", module.audio.open_kwargs)
-        self.assertEqual(module.audio.open_kwargs["frames_per_buffer"], 960)
+        self.assertEqual(module.audio.open_kwargs["frames_per_buffer"], 4_800)
 
     def test_microphone_keeps_audio_when_portaudio_timestamp_moves_backwards(self) -> None:
         payload = array("h", [8192] * 960).tobytes()
@@ -353,7 +1062,7 @@ class WindowsBackendUnitTests(unittest.TestCase):
         self.assertEqual(source.device_block_count, 1)
         self.assertEqual(source.synthetic_silence_block_count, 0)
         assert module.audio.open_kwargs is not None
-        self.assertEqual(module.audio.open_kwargs["frames_per_buffer"], 960)
+        self.assertEqual(module.audio.open_kwargs["frames_per_buffer"], 4_800)
 
     def test_100ms_microphone_callback_splits_into_five_ordered_blocks(self) -> None:
         pcm = array("h")
@@ -391,7 +1100,7 @@ class WindowsBackendUnitTests(unittest.TestCase):
         self.assertEqual(source.callback_payload_frame_count, 4_800)
         self.assertEqual(source.device_block_count, 5)
         assert module.audio.open_kwargs is not None
-        self.assertEqual(module.audio.open_kwargs["frames_per_buffer"], 960)
+        self.assertEqual(module.audio.open_kwargs["frames_per_buffer"], 4_800)
 
     def test_callback_status_preserves_current_payload_and_reports_discontinuity(self) -> None:
         payload = array("h", [0] * 960).tobytes()

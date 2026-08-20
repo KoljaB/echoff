@@ -2,6 +2,27 @@
 
 All notable changes will be documented here.
 
+## 0.3.0 - 2026-08-20
+
+- Preserve the v0.2.0 public export, constructor, processor-protocol, and
+  configuration surface while adding the optional `reset_echo_path()` API and
+  additive AEC state, frame-timing, capture-status, and event telemetry.
+- Process only confirmed reference/microphone pairs. Retire and count leading
+  unpaired microphone blocks instead of creating synthetic reference slots;
+  bounded degraded-buffer retirement also applies without artifacts, while
+  received raw payloads are preserved only when artifacts are enabled.
+- Add truthful `completed`, `incomplete`, `degraded`, and `failed` capture
+  outcomes. Probe runs preserve artifacts and reject any non-`completed` result.
+- Serialize capture shutdown and make pending source cleanup, worker joins,
+  recorder closes, and atomic-summary writes safely retryable. Retries preserve
+  the first terminal error/status and do not duplicate `capture_stopped`, create
+  a second summary, or change recorded WAV frames.
+- Add hard echo-path reset boundaries that discard partial streaming/buffered
+  adapter tails, and report degraded readiness, discontinuity, and reset events.
+- Support Windows WASAPI loopback/microphone capture with a strict, hidden
+  WDM-KS microphone fallback, and Linux PipeWire sink-monitor/source capture
+  through `pactl`, `pw-dump`, and `pw-record`.
+
 ## 0.2.0 - 2026-08-14
 
 - Add built-in Linux live capture through PipeWire while leaving the Windows

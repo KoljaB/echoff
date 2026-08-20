@@ -33,25 +33,27 @@ List the PipeWire endpoints Echoff can select:
 .venv/bin/echoff devices
 ```
 
-Use the exact selector shown for the stereo output's monitor as `--reference`
-and the microphone source as `--microphone`. Explicit selectors make a probe
-repeatable even if the desktop default later changes.
+Use the exact selector shown for the stereo output's monitor as
+`--reference-device` and the microphone source as `--microphone-device`.
+Explicit selectors make a probe repeatable even if the desktop default later
+changes. `AecConfig(backend="auto")` selects the Linux PipeWire backend; the
+`record` command has no `--backend` option.
 
 ## Record an inspectable session
 
 ```bash
 .venv/bin/echoff record \
-  --backend pipewire \
-  --reference '<sink-monitor-selector>' \
-  --microphone '<microphone-selector>' \
+  --reference-device '<sink-monitor-selector>' \
+  --microphone-device '<microphone-selector>' \
   --duration 15 \
   --output captures/linux-first
 ```
 
 While it records, play speech through the selected stereo output and speak near
-the microphone. The command preserves independent `reference.wav`,
-`microphone.wav`, and `cleaned.wav` tracks plus events, metrics, and a summary.
-It never mixes system audio into the microphone before AEC.
+the microphone. The command preserves independent `computer_audio.wav`,
+`microphone_raw.wav`, and `microphone_aec.wav` tracks plus the received-source
+tracks `reference_received.wav` and `microphone_received.wav`, events, metrics,
+and a summary. It never mixes system audio into the microphone before AEC.
 
 ## Repeatable audible probe
 
@@ -59,9 +61,8 @@ For a PipeWire-compatible sink name from `pactl list short sinks`, run:
 
 ```bash
 PULSE_SINK='<sink-name>' .venv/bin/echoff record \
-  --backend pipewire \
-  --reference '<sink-monitor-selector>' \
-  --microphone '<microphone-selector>' \
+  --reference-device '<sink-monitor-selector>' \
+  --microphone-device '<microphone-selector>' \
   --play-wav /usr/share/sounds/alsa/Front_Center.wav \
   --repetitions 8 \
   --gap 1 \

@@ -23,8 +23,6 @@ class AecProcessor(Protocol):
         microphone: Sequence[float],
     ) -> tuple[float, ...]: ...
 
-    def reset_echo_path(self) -> None: ...
-
     def reset_alignment(self) -> None: ...
 
     @property
@@ -275,14 +273,13 @@ class StreamingWebRtcAecProcessor(WebRtcAecProcessor):
         return tuple(output)
 
     def reset_echo_path(self) -> None:
-        """Cold-start AEC at a synchronized streaming boundary."""
+        """Cold-start AEC and discard all pre-reset streaming state."""
 
         with self._lock:
-            if self._reference_activity_pending:
-                raise RuntimeError(
-                    "streaming echo-path reset requires a synchronized boundary"
-                )
             self._reset_echo_path_locked()
+            self._reference_pending.clear()
+            self._microphone_pending.clear()
+            self._reference_activity_pending.clear()
 
     def reset_alignment(self) -> None:
         with self._lock:
@@ -354,6 +351,14 @@ class BufferedWebRtcAecProcessor(WebRtcAecProcessor):
             self._reference_pending.extend([0.0] * padding)
             self._microphone_pending.extend([0.0] * padding)
             return self._process_pending_locked()[:count]
+
+    def reset_echo_path(self) -> None:
+        """Cold-start AEC and discard any pre-reset partial pair."""
+
+        with self._lock:
+            self._reset_echo_path_locked()
+            self._reference_pending.clear()
+            self._microphone_pending.clear()
 
     def reset_alignment(self) -> None:
         with self._lock:

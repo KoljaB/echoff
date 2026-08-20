@@ -33,9 +33,11 @@ No module owns both platform device I/O and WebRTC processing.
 
 The three processed tracks advance exactly once for each confirmed
 reference/microphone pair and therefore always have equal length. Unpaired input
-never creates a synthetic processed slot. When artifact recording is enabled,
-the received-source tracks independently preserve every parseable payload in
-source order.
+never creates a synthetic processed slot. Leading unpaired microphone blocks are
+retired from the processed timeline and counted in
+`startup_unpaired_microphone_blocks`. When artifact recording is enabled, the
+received-source tracks independently preserve every parseable payload in source
+order.
 
 Each source owns a sample-count clock. The callback captures local monotonic time
 before parsing, then maps PortAudio's `inputBufferAdcTime` relative to the same
@@ -44,25 +46,25 @@ The mapped time is evidence only: received sample count determines block sequenc
 and a timestamp jump cannot create, remove, or duplicate samples.
 
 Startup requires three consecutive compatible observations. The resulting
-sequence offset remains authoritative throughout the epoch. If it proves that
-reference capture began within the supported startup horizon after microphone
-capture, the leading microphone slots are processed with a zero far-end channel
-and emitted with `reference_present=False`. This preserves the microphone
-payload without inventing stale reference audio and is counted by
-`zero_filled_reference_blocks`. Once the first real pair has been processed,
-when either expected head is missing, one explicit synchronization episode
-starts at the worker's first observation and buffers both directions for up to
-the configured reserve (15 seconds by default). Arrival inside the reserve
-drains all confirmed pairs in order without zero-fill, payload retirement,
-mapping loss, or APM reset.
+sequence offset remains authoritative throughout the epoch. Leading microphone
+blocks without a matching reference are retired from the processed timeline and
+counted in `startup_unpaired_microphone_blocks`; they are never processed with a
+synthetic zero far-end channel. When artifacts are enabled, the raw microphone
+payload remains in `microphone_received.wav`. Once the first real pair has been
+processed, when either expected head is missing, one explicit synchronization
+episode starts at the worker's first observation and buffers both directions for
+up to the configured reserve (3 seconds by default). Arrival inside the reserve
+drains all confirmed pairs in order without synthetic audio, mapping loss, or APM
+reset.
 
 After lock, timestamp residuals and gradual device-clock drift are telemetry;
 they do not change pair identity. A source failure or expired reserve enters an
-explicit degraded state and suspends paired output. With artifact recording,
-raw source payloads continue to be written and excess live buffers are retired
-under disjoint cause counters. A proven source sequence discontinuity opens one
-new epoch and resets WebRTC immediately before the first new-epoch pair, never
-before already valid queued pairs.
+explicit degraded state and suspends paired output. Excess live buffers are
+retired under disjoint cause counters even without artifact recording; when
+artifacts are enabled, raw source payloads are also preserved in the received
+tracks. A proven source sequence discontinuity opens one new epoch and resets
+WebRTC immediately before the first new-epoch pair, never before already valid
+queued pairs.
 
 Callbacks with arbitrary positive sample counts are accumulated into fixed
 blocks without reordering. A PortAudio status flag preserves the current payload
@@ -71,11 +73,13 @@ failures are surfaced and degrade pairing rather than directly raising from
 `raise_if_failed()`. Processing/callback failures and an unsafe unbounded
 backlog remain failures.
 
-All received reference and microphone payloads are written in source order to
-`reference_received.wav` and `microphone_received.wav`. After degraded live
-buffers exceed the bounded reserve, retirements cannot be inserted
-retroactively without unbounded latency; they remain in the raw tracks and are
-reconciled by explicit timeout or source-failure counters.
+When artifact recording is enabled, all received reference and microphone
+payloads are written in source order to `reference_received.wav` and
+`microphone_received.wav`. After degraded live buffers exceed the bounded
+reserve, retirements cannot be inserted retroactively without unbounded latency;
+they are reconciled by explicit timeout or source-failure counters. Without
+artifacts, the bounded live buffers are still retired and counted, but no raw
+source track is written.
 
 ## APM contract
 
@@ -94,11 +98,12 @@ a rolling one-second raw-to-clean microphone reduction of at least 10 dB to
 remain true for 250 ms before readiness latches. The raw microphone must also
 have enough exposure to make that reduction meaningful. Silence and unpaired
 startup/shutdown frames do not advance the gate. `reset_echo_path()` recreates
-APM and restarts this quality gate without changing stream alignment or queued
-paired samples. `reset_alignment()` does the same cold start while also opening
-a new alignment epoch and clearing adapter tails. Same-epoch waits and recovery
-do not reset APM automatically, although degraded alignment gates the public
-readiness state false.
+APM and restarts this quality gate without changing the capture alignment epoch,
+but it is a hard boundary: any partial streaming or buffered adapter tails are
+discarded. `reset_alignment()` performs the same cold start, clears adapter tails,
+and also opens a new alignment epoch. Same-epoch waits and recovery do not reset
+APM automatically, although degraded alignment gates the public readiness state
+false.
 
 This is a signal-derived state, not an application policy. Applications decide
 whether to defer VAD or barge-in while the path is cold and must still validate

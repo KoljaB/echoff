@@ -15,6 +15,7 @@ from typing import Any
 from .analysis import analyze_capture
 from .capture import AecCapture
 from .config import AecConfig
+from .errors import AudioBackendError
 
 LOGGER = logging.getLogger(__name__)
 PLAYBACK_WINDOW_KIND = "ffplay_process_lifetime_on_confirmed_pair_timeline"
@@ -189,6 +190,13 @@ def run_probe(config: ProbeConfig) -> dict[str, Any]:
         if not interrupted:
             capture.stop()
 
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    if summary.get("status") != "completed":
+        raise AudioBackendError(
+            "hardware probe did not complete with two active, paired sources: "
+            f"status={summary.get('status')!r}; artifacts were preserved at {output}"
+        )
+
     # Trim player startup/drain edges. These are echo-suppression windows only
     # when the operator followed the probe instruction to remain silent.
     far_end_windows = [
@@ -201,6 +209,6 @@ def run_probe(config: ProbeConfig) -> dict[str, Any]:
     LOGGER.info("tracks and diagnostics: %s", output / "summary.json")
     return {
         "output_dir": str(output),
-        "summary": json.loads((output / "summary.json").read_text(encoding="utf-8")),
+        "summary": summary,
         "analysis": analysis,
     }

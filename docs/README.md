@@ -46,7 +46,7 @@ Choose the shortest path that matches what you are trying to do.
 
 ## Current support boundary
 
-Echoff 0.2 is alpha software. Built-in physical capture is supported on
+Echoff 0.3.0 is alpha software. Built-in physical capture is supported on
 Windows and Linux. Linux live capture requires PipeWire command-line tools.
 The macOS processor path is designed for applications that already own
 correctly aligned PCM and environments where LiveKit installs, but it is not

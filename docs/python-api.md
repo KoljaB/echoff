@@ -30,7 +30,7 @@ capture emits 20 ms blocks (960 samples) by default.
 | `high_pass_filter` | `True` | Enable WebRTC high-pass filtering |
 | `automatic_gain_control` | `False` | Enable WebRTC AGC; off by default to avoid changing level policy silently |
 | `pair_tolerance_s` | `0.010` | Tolerance for startup/recovery timing evidence; no more than half a capture block |
-| `reference_stall_grace_s` | `15.0` | Symmetric exceptional reserve for either temporarily late source; starts when the worker first observes an unmatched head |
+| `reference_stall_grace_s` | `3.0` | Symmetric exceptional reserve for either temporarily late source; starts when the worker first observes an unmatched head |
 | `queue_fatal_s` | `15.0` | Backlog duration that becomes a fatal health error |
 | `startup_timeout_s` | `3.0` | Maximum wait for the first aligned pair |
 | `echo_path_warmup_s` | `7.5` | Minimum paired active far-end time before readiness |
@@ -39,8 +39,8 @@ capture emits 20 ms blocks (960 samples) by default.
 | `echo_path_quality_stable_s` | `0.25` | Required consecutive quality-qualified time |
 | `echo_path_min_suppression_db` | `10.0` | Minimum measured raw-to-clean reduction |
 | `echo_path_quality_min_raw_rms` | `0.003` | Minimum raw-mic exposure for a meaningful quality decision |
-| `backend` | `"auto"` | `"auto"` or `"windows"`; built-in capture still requires Windows |
-| `allow_wdmks_microphone_fallback` | `True` | Try a matched (or sole) WDM-KS mic if WASAPI cannot open |
+| `backend` | `"auto"` | `"auto"`, `"windows"`, or `"pipewire"`; built-in capture is supported on Windows and Linux |
+| `allow_wdmks_microphone_fallback` | `True` | After a WASAPI microphone open failure, try WDM-KS only after a unique normalized physical-name match and a successful start; the fallback is hidden from `devices` |
 
 Use `config.to_dict()` for JSON-compatible effective settings.
 
@@ -87,10 +87,15 @@ down audio processing.
 
 - `start() -> AecCapture`: single-use startup; waits for initial source audio,
   not necessarily an aligned pair.
-- `stop(error=None, status_name=None)`: idempotent cleanup and finalization.
-- `reset_echo_path()`: atomically recreates the adaptive AEC filter while
-  preserving capture alignment, queues, and the processed-sample timeline.
-  Call it only at an application-owned conversational boundary.
+- `stop(error=None, status_name=None)`: serialized, idempotent cleanup and
+  finalization. A later call retries pending source cleanup, worker joins,
+  recorder closes, or atomic-summary creation while preserving the first
+  terminal error/status and exactly-once stop event/summary.
+- `reset_echo_path()`: an additive optional processor capability that atomically
+  recreates the adaptive AEC filter while preserving the capture alignment epoch
+  and processed-sample timeline. It is a hard boundary: any partial streaming or
+  buffered adapter tails are discarded. Custom v0.2 processors may not expose
+  this method; feature-detect it before calling through a processor abstraction.
 - `status() -> CaptureStatus`: immutable current snapshot.
 - `raise_if_failed()`: records source failures as degraded status/events and
   raises on processing/callback failure or an unsafe fatal backlog.
@@ -115,8 +120,13 @@ explicit degraded status and telemetry.
 `AecFrame` contains:
 
 - `reference`, `microphone_raw`, `microphone_clean`;
-- `reference_ended_monotonic`, `microphone_ended_monotonic`;
-- `pair_skew_s` (`reference_end - microphone_end`); and
+- `reference_ended_monotonic` and `microphone_ended_monotonic`, the canonical
+  processed-timeline ends (equal for a confirmed pair);
+- nullable `reference_observed_end_monotonic` and
+  `microphone_observed_end_monotonic`, the per-source observed end times when
+  timing evidence is valid; and
+- `pair_skew_s`, which uses observed end times when valid and otherwise falls
+  back to the canonical timeline; and
 - `state: AecState`.
 
 `AecState` contains `echo_path_ready`, cumulative `far_end_active_s` for the
@@ -143,9 +153,12 @@ cold starts, including those caused by stream realignment.
   stream-alignment reset count; and
 - processing: mean/max processing milliseconds.
 
-Serialized captures identify `echoff-capture-artifacts-v2`. Echoff is alpha;
-validate the schema before consuming fields and use `to_dict()` rather than
-reflecting over dataclass internals.
+Serialized captures identify `echoff-capture-artifacts-v2`. Echoff 0.3.0 is
+alpha; capture summaries use the additive statuses `completed`, `incomplete`,
+`degraded`, and `failed`.
+New status fields and event kinds are additive; strict consumers should tolerate
+unknown fields and kinds, validate the schema before consuming fields, and use
+`to_dict()` rather than reflecting over dataclass internals.
 
 ## `WebRtcAecProcessor`
 
@@ -164,17 +177,20 @@ state = processor.state
 `process_pair()` requires non-empty equal blocks with lengths divisible by 480.
 It submits every reverse frame immediately before the matching microphone frame
 while holding one internal lock, and returns the same sample count.
-`reset_echo_path()` preserves stream alignment and any paired adapter tail;
-`reset_alignment()` starts a new alignment epoch and clears adapter tails.
-The separate streaming adapter requires `reset_echo_path()` to be called when
-no complete reference frame is awaiting its microphone partner.
+Concrete processors additionally expose `reset_echo_path()` as an optional
+capability. It cold-starts the adaptive filter at a hard boundary, preserves the
+current alignment epoch, and discards any partial streaming or buffered adapter
+tails. `reset_alignment()` performs the same cold start and tail discard while
+also opening a new alignment epoch. The v0.2-compatible `AecProcessor` protocol
+does not require `reset_echo_path()`; custom processors may omit it.
 
 ## `BufferedWebRtcAecProcessor`
 
 Accepts aligned equal pairs with arbitrary call boundaries. It returns only
 complete 480-sample outputs; therefore a call can return fewer samples than it
 received. `flush()` zero-pads inside APM but returns only the real pending sample
-count. `reset_alignment()` clears partial buffers.
+count. `reset_alignment()` clears partial buffers. `reset_echo_path()` also clears
+partial buffers because it is a hard reset boundary.
 
 ```python
 from echoff import BufferedWebRtcAecProcessor
@@ -250,7 +266,9 @@ report = analyze_capture(
 ```
 
 `run_probe()` requires a new or empty output directory and writes capture plus
-analysis artifacts. `analyze_capture()` requires the three equal-timeline WAVs;
+analysis artifacts. It preserves finalized artifacts and raises if the capture
+summary status is not `completed`. `analyze_capture()` requires the three
+equal-timeline WAVs;
 with `write_report=False` it returns a report without modifying the directory.
 With `write_report=True` (default), it exclusive-creates `analysis.json` and
 fails if that report or its temporary file already exists.

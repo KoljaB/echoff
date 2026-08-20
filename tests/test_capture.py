@@ -6,12 +6,14 @@ import threading
 import time
 import unittest
 import wave
+from collections import deque
 from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 from echoff import AecCapture, AecConfig, AudioBackendError, CaptureStateError
+from echoff.alignment import AlignmentUpdate
 from echoff.models import AecState, AudioBlock
 
 
@@ -43,6 +45,34 @@ class FakeProcessor:
             stream_alignment_reset_count=self.reset_count,
             echo_path_reset_count=self.echo_path_reset_count,
         )
+
+
+class LegacyProcessor:
+    """A v0.2-style custom processor with no echo-path reset capability."""
+
+    def __init__(self) -> None:
+        self.pairs = []
+        self.reset_count = 0
+
+    def process_pair(self, reference, microphone):
+        self.pairs.append((tuple(reference), tuple(microphone)))
+        return tuple(microphone)
+
+    def reset_alignment(self) -> None:
+        self.reset_count += 1
+
+    @property
+    def state(self):
+        class LegacyState:
+            echo_path_ready = False
+            far_end_active_s = 0.0
+            alignment_epoch = 0
+            stream_alignment_reset_count = 0
+            echo_path_quality_ready = False
+            echo_suppression_db = None
+            echo_quality_s = 0.0
+
+        return LegacyState()
 
 
 class FakeSource:
@@ -113,6 +143,16 @@ class FakeSource:
             raise self.stop_error
 
 
+class ShutdownOverflowSource(FakeSource):
+    def __init__(self, backend: str, callback, rows) -> None:
+        super().__init__(backend, callback, rows)
+        self.callback_queue_overflow_count = 0
+
+    def stop(self) -> None:
+        self.callback_queue_overflow_count = 1
+        super().stop()
+
+
 def factory_for(reference_rows, microphone_rows):
     sources = []
 
@@ -126,6 +166,104 @@ def factory_for(reference_rows, microphone_rows):
 
 
 class AecCaptureTests(unittest.TestCase):
+    def test_capture_ready_waits_for_active_backend_metadata(self) -> None:
+        release_active = threading.Event()
+        callback_sent = threading.Event()
+        events = []
+
+        class BarrierMicrophone(FakeSource):
+            def __init__(self, callback) -> None:
+                super().__init__("uninitialized", callback, [(0.1, 0.02)])
+                self.selected_device_name = None
+                self.selected_device_index = None
+                self.active_event = threading.Event()
+                self.publisher: threading.Thread | None = None
+
+            def activate(self) -> None:
+                super().activate()
+                callback_sent.set()
+
+                def publish() -> None:
+                    release_active.wait()
+                    self.backend_name = "active-microphone"
+                    self.selected_device_name = "Active microphone"
+                    self.selected_device_index = 7
+                    self.active_event.set()
+
+                self.publisher = threading.Thread(target=publish, daemon=True)
+                self.publisher.start()
+
+            def stop(self) -> None:
+                release_active.set()
+                if self.publisher is not None:
+                    self.publisher.join(timeout=1.0)
+                super().stop()
+
+        def factory(
+            _config,
+            reference_callback,
+            microphone_callback,
+            _reference_device,
+            _microphone_device,
+        ):
+            reference = FakeSource(
+                "active-reference",
+                reference_callback,
+                [(1.0, 0.02)],
+            )
+            microphone = BarrierMicrophone(microphone_callback)
+            return reference, microphone
+
+        capture = AecCapture(
+            AecConfig(startup_timeout_s=1.0),
+            processor=FakeProcessor(),
+            source_factory=factory,
+            on_event=events.append,
+        )
+        start_errors: list[Exception] = []
+
+        def start_capture() -> None:
+            try:
+                capture.start()
+            except Exception as exc:
+                start_errors.append(exc)
+
+        starter = threading.Thread(target=start_capture)
+        starter.start()
+        self.assertTrue(callback_sent.wait(1.0))
+        self.assertNotIn("capture_ready", [event.kind for event in events])
+        release_active.set()
+        starter.join(timeout=1.0)
+
+        self.assertFalse(starter.is_alive())
+        self.assertEqual(start_errors, [])
+        ready = [event for event in events if event.kind == "capture_ready"]
+        self.assertEqual(len(ready), 1)
+        self.assertEqual(ready[0].details["microphone_backend"], "active-microphone")
+        self.assertEqual(
+            ready[0].details["microphone_device_name"],
+            "Active microphone",
+        )
+        capture.stop()
+
+    def test_legacy_processor_remains_usable_without_echo_path_reset(self) -> None:
+        rows = [(1.0, 0.02), (2.0, 0.04), (3.0, 0.06)]
+        processor = LegacyProcessor()
+        capture = AecCapture(
+            processor=processor,
+            source_factory=factory_for(rows, rows)[0],
+        )
+
+        capture.start()
+        deadline = time.monotonic() + 0.5
+        while len(processor.pairs) < 3 and time.monotonic() < deadline:
+            time.sleep(0.002)
+        self.assertEqual(len(processor.pairs), 3)
+        self.assertEqual(capture.status().echo_path_reset_count, 0)
+        with self.assertRaisesRegex(CaptureStateError, "does not support"):
+            capture.reset_echo_path()
+        capture.stop()
+
     def test_echo_path_reset_preserves_capture_alignment(self) -> None:
         processor = FakeProcessor()
         events = []
@@ -398,8 +536,8 @@ class AecCaptureTests(unittest.TestCase):
         self.assertNotIn("synchronization_wait_started", [event.kind for event in events])
         self.assertNotIn("synchronization_wait_ended", [event.kind for event in events])
 
-    def test_three_block_microphone_preroll_is_emitted_without_stale_reference(self) -> None:
-        """A later-starting reference must not deadlock or discard early speech."""
+    def test_three_block_microphone_preroll_is_retired_without_stale_reference(self) -> None:
+        """A later reference must not deadlock or synthesize paired far-end audio."""
 
         processor = FakeProcessor()
         events = []
@@ -466,22 +604,23 @@ class AecCaptureTests(unittest.TestCase):
         finally:
             capture._stop_processing()
 
-        self.assertEqual(len(frames), 6)
+        self.assertEqual(len(frames), 3)
         self.assertEqual(
             [frame.microphone_raw[0] for frame in frames],
-            [200.0, 201.0, 202.0, 203.0, 204.0, 205.0],
+            [203.0, 204.0, 205.0],
         )
         self.assertEqual(
             [frame.reference_present for frame in frames],
-            [False, False, False, True, True, True],
+            [True, True, True],
         )
         self.assertEqual(
             [pair[0][0] for pair in processor.pairs],
-            [0.0, 0.0, 0.0, 100.0, 101.0, 102.0],
+            [100.0, 101.0, 102.0],
         )
-        self.assertEqual(capture.status().processed_pair_count, 6)
+        self.assertEqual(capture.status().processed_pair_count, 3)
         self.assertEqual(capture.status().matched_reference_blocks, 3)
-        self.assertEqual(capture.status().zero_filled_reference_blocks, 3)
+        self.assertEqual(capture.status().zero_filled_reference_blocks, 0)
+        self.assertEqual(capture.status().startup_unpaired_microphone_blocks, 3)
         self.assertEqual(capture.status().synchronization_wait_timeout_count, 0)
         self.assertNotIn("synchronization_degraded", [event.kind for event in events])
 
@@ -666,6 +805,118 @@ class AecCaptureTests(unittest.TestCase):
         reset_index = order.index(("alignment_realigning", -1.0))
         self.assertLess(order.index(("frame", 24.0)), reset_index)
         self.assertLess(reset_index, order.index(("frame", 25.0)))
+        self.assertEqual(
+            [kind for kind, _value in order].count("alignment_discontinuity_pending"),
+            1,
+        )
+
+    def test_retired_startup_discontinuity_resets_before_first_real_pair(self) -> None:
+        processor = FakeProcessor()
+        order: list[tuple[str, float]] = []
+        capture = AecCapture(
+            AecConfig(
+                block_duration_s=0.010,
+                pair_tolerance_s=0.005,
+                reference_stall_grace_s=0.060,
+            ),
+            processor=processor,
+            source_factory=factory_for([], [])[0],
+            on_frame=lambda frame: order.append(("frame", frame.microphone_raw[0])),
+            on_event=lambda event: order.append((event.kind, -1.0)),
+        )
+        capture._processor = processor
+        for sequence in range(6):
+            ended = 4.000 + sequence * 0.010
+            capture._microphone_queue.put(
+                AudioBlock(
+                    (200.0 + sequence,) * 480,
+                    ended,
+                    sequence=sequence,
+                    callback_monotonic=ended,
+                    observed_end_monotonic=ended,
+                    discontinuity=sequence == 0,
+                )
+            )
+        for sequence in range(3):
+            ended = 4.030 + sequence * 0.010
+            capture._reference_queue.put(
+                AudioBlock(
+                    (100.0 + sequence,) * 480,
+                    ended,
+                    sequence=sequence,
+                    callback_monotonic=ended,
+                    observed_end_monotonic=ended,
+                )
+            )
+        capture._processing_stop.set()
+
+        capture._run_processing()
+
+        self.assertEqual(len(processor.pairs), 3)
+        self.assertEqual(processor.reset_count, 1)
+        self.assertEqual(capture.status().startup_unpaired_microphone_blocks, 3)
+        self.assertEqual(
+            [kind for kind, _value in order].count("alignment_discontinuity_pending"),
+            1,
+        )
+        reset_index = order.index(("alignment_realigning", -1.0))
+        self.assertLess(reset_index, order.index(("frame", 203.0)))
+
+    def test_discontinuity_without_a_new_pair_is_reported_but_not_reset(self) -> None:
+        processor = FakeProcessor()
+        events = []
+        capture = AecCapture(
+            processor=processor,
+            source_factory=factory_for([], [])[0],
+            on_event=events.append,
+        )
+        capture._processor = processor
+        capture._microphone_queue.put(
+            AudioBlock(
+                (0.1,) * 960,
+                1.0,
+                sequence=0,
+                callback_monotonic=1.0,
+                observed_end_monotonic=1.0,
+                discontinuity=True,
+            )
+        )
+        capture._processing_stop.set()
+
+        capture._run_processing()
+
+        self.assertEqual(processor.reset_count, 0)
+        self.assertEqual(
+            [event.kind for event in events].count("alignment_discontinuity_pending"),
+            1,
+        )
+
+    def test_microphone_epoch_discards_all_previously_mapped_references(self) -> None:
+        capture = AecCapture(
+            processor=FakeProcessor(),
+            source_factory=factory_for([], [])[0],
+        )
+        reference_slots = {
+            slot: AudioBlock((float(slot),) * 960, float(slot), sequence=slot)
+            for slot in range(3, 10)
+        }
+        update = AlignmentUpdate(
+            unmapped=(AudioBlock((1.0,) * 960, 1.0, sequence=1),),
+            hard_discontinuity=True,
+        )
+
+        capture._requeue_invalidated_references(
+            update,
+            slot=7,
+            references=deque(),
+            reference_slots=reference_slots,
+        )
+
+        self.assertEqual(reference_slots, {})
+        self.assertEqual(
+            capture.status().hard_discontinuity_unpaired_reference_blocks,
+            8,
+        )
 
     def test_context_manager_writes_equal_timeline_tracks_and_summary(self) -> None:
         factory, sources = factory_for(
@@ -768,8 +1019,10 @@ class AecCaptureTests(unittest.TestCase):
         self.assertEqual(capture.status().shutdown_unpaired_microphone_blocks, 3)
         self.assertFalse(capture.status().alignment_locked)
         self.assertIn("capture_ready", [event.kind for event in events])
+        stopped = [event for event in events if event.kind == "capture_stopped"]
+        self.assertEqual(stopped[-1].details["status"], "incomplete")
 
-    def test_late_starting_reference_emits_early_microphones_without_stale_reference(
+    def test_late_starting_reference_retires_early_microphones_without_stale_reference(
         self,
     ) -> None:
         factory, _sources = factory_for(
@@ -785,11 +1038,13 @@ class AecCaptureTests(unittest.TestCase):
         )
         processor = FakeProcessor()
         frames = []
+        references = []
         capture = AecCapture(
             AecConfig(startup_timeout_s=0.5),
             processor=processor,
             source_factory=factory,
             on_frame=frames.append,
+            on_reference=lambda samples, _ended: references.append(samples[0]),
         )
 
         capture.start()
@@ -798,17 +1053,19 @@ class AecCaptureTests(unittest.TestCase):
         self.assertTrue(capture.status().alignment_locked)
         self.assertEqual(
             [pair[0][0] for pair in processor.pairs],
-            [0.0, 0.0, 0.0, 1.0, 2.0, 3.0],
+            [1.0, 2.0, 3.0],
         )
         self.assertEqual(
             [pair[1][0] for pair in processor.pairs],
-            [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            [0.4, 0.5, 0.6],
         )
         self.assertEqual(
             [frame.reference_present for frame in frames],
-            [False, False, False, True, True, True],
+            [True, True, True],
         )
-        self.assertEqual(capture.status().zero_filled_reference_blocks, 3)
+        self.assertEqual(references, [1.0, 2.0, 3.0])
+        self.assertEqual(capture.status().zero_filled_reference_blocks, 0)
+        self.assertEqual(capture.status().startup_unpaired_microphone_blocks, 3)
         self.assertEqual(capture.status().shutdown_unpaired_microphone_blocks, 0)
 
     def test_reference_callback_is_aligned_while_raw_reference_is_preserved(self) -> None:
@@ -1078,6 +1335,7 @@ class AecCaptureTests(unittest.TestCase):
                 13 * 960,
             )
             self.assertEqual(summary["tracks"]["microphone_raw"]["frames"], 3 * 960)
+            self.assertEqual(summary["status"], "degraded")
             self.assertEqual(
                 [event.kind for event in events].count("synchronization_degraded"),
                 1,
@@ -1176,6 +1434,64 @@ class AecCaptureTests(unittest.TestCase):
                 [event.kind for event in events].count("alignment_realigning"),
                 1,
             )
+
+    def test_reference_only_barrier_recovers_from_degraded_state(self) -> None:
+        processor = FakeProcessor()
+        events = []
+        initial_rows = [
+            (float(sequence), 8.0 + sequence * 0.020)
+            for sequence in range(3)
+        ]
+        capture = AecCapture(
+            AecConfig(reference_stall_grace_s=0.060),
+            processor=processor,
+            source_factory=factory_for(initial_rows, initial_rows)[0],
+            on_event=events.append,
+        )
+
+        def block(value: float, sequence: int, *, discontinuity: bool = False) -> AudioBlock:
+            ended = 8.0 + sequence * 0.020
+            return AudioBlock(
+                (value,) * 960,
+                ended,
+                sequence=sequence,
+                callback_monotonic=time.monotonic(),
+                observed_end_monotonic=ended,
+                discontinuity=discontinuity,
+            )
+
+        capture.start()
+        deadline = time.monotonic() + 0.5
+        while len(processor.pairs) < 3 and time.monotonic() < deadline:
+            time.sleep(0.002)
+        self.assertEqual(len(processor.pairs), 3)
+
+        for sequence in range(3, 7):
+            capture._enqueue_microphone(block(100.0 + sequence, sequence))
+        deadline = time.monotonic() + 0.5
+        while capture.status().alignment_mode != "degraded" and time.monotonic() < deadline:
+            time.sleep(0.002)
+        self.assertEqual(capture.status().alignment_mode, "degraded")
+
+        for sequence in range(3, 8):
+            capture._enqueue_reference(
+                block(
+                    200.0 + sequence,
+                    sequence,
+                    discontinuity=sequence == 3,
+                )
+            )
+        capture._enqueue_microphone(block(107.0, 7))
+        deadline = time.monotonic() + 0.75
+        while len(processor.pairs) < 6 and time.monotonic() < deadline:
+            time.sleep(0.002)
+        capture.stop()
+
+        self.assertGreaterEqual(len(processor.pairs), 6)
+        self.assertEqual(processor.reset_count, 1)
+        self.assertEqual(capture.status().hard_discontinuity_count, 1)
+        self.assertIn("alignment_discontinuity_pending", [event.kind for event in events])
+        self.assertIn("alignment_realigning", [event.kind for event in events])
 
     def test_same_epoch_degraded_recovery_keeps_sequence_mapping(self) -> None:
         processor = FakeProcessor()
@@ -1294,10 +1610,16 @@ class AecCaptureTests(unittest.TestCase):
                 2_880,
             )
             self.assertEqual(summary["tracks"]["microphone_raw"]["frames"], 0)
+            self.assertEqual(summary["status"], "degraded")
             self.assertEqual(
                 [event.kind for event in events].count("reference_source_degraded"),
                 1,
             )
+            self.assertEqual(
+                [event.kind for event in events].count("capture_degraded_ready"),
+                1,
+            )
+            self.assertNotIn("capture_ready", [event.kind for event in events])
             self.assertTrue(all(source.stopped for source in sources))
 
     def test_internal_worker_backlog_is_included_in_health_limit(self) -> None:
@@ -1310,6 +1632,129 @@ class AecCaptureTests(unittest.TestCase):
 
         with self.assertRaisesRegex(AudioBackendError, "processing backlog"):
             capture.raise_if_failed()
+
+    def test_internal_worker_buffers_are_bounded_and_fail_explicitly(self) -> None:
+        config = AecConfig(
+            reference_stall_grace_s=0.100,
+            queue_fatal_s=0.100,
+        )
+        capture = AecCapture(
+            config,
+            processor=FakeProcessor(),
+            source_factory=factory_for([], [])[0],
+        )
+        capture._processor = FakeProcessor()
+        capture._start_processing()
+
+        def block(sequence: int, *, reference: bool) -> AudioBlock:
+            ended = (100.0 if reference else 1.0) + sequence * config.block_duration_s
+            return AudioBlock(
+                (float(sequence),) * config.block_samples,
+                ended,
+                sequence=sequence,
+                callback_monotonic=time.monotonic(),
+                observed_end_monotonic=ended,
+            )
+
+        for sequence in range(3):
+            capture._enqueue_microphone(block(sequence, reference=False))
+        for sequence in range(20):
+            capture._enqueue_reference(block(sequence, reference=True))
+            time.sleep(0.010)
+
+        deadline = time.monotonic() + 0.5
+        while capture._processing_error is None and time.monotonic() < deadline:
+            time.sleep(0.002)
+
+        self.assertIsNotNone(capture._processing_error)
+        self.assertLessEqual(
+            capture._internal_reference_pending_blocks,
+            capture._capture_queue_capacity_blocks,
+        )
+        with self.assertRaisesRegex(AudioBackendError, "processing backlog"):
+            capture.raise_if_failed()
+        capture._stop_processing()
+
+    def test_capture_ingress_queue_has_a_hard_fatal_capacity(self) -> None:
+        capture = AecCapture(
+            AecConfig(queue_fatal_s=0.040),
+            processor=FakeProcessor(),
+            source_factory=factory_for([], [])[0],
+        )
+        block = AudioBlock((0.1,) * 960, 1.0, sequence=0)
+
+        capture._enqueue_microphone(block)
+        capture._enqueue_microphone(block)
+        with self.assertRaisesRegex(AudioBackendError, "fatal capacity"):
+            capture._enqueue_microphone(block)
+
+        self.assertEqual(capture._microphone_queue.qsize(), 2)
+        self.assertEqual(capture.status().microphone_queue_overflow_count, 1)
+        with self.assertRaisesRegex(AudioBackendError, "capture processing failed"):
+            capture.raise_if_failed()
+
+    def test_fatal_limit_caps_custom_long_grace_without_artifacts(self) -> None:
+        config = AecConfig(
+            block_duration_s=0.010,
+            pair_tolerance_s=0.005,
+            reference_stall_grace_s=0.500,
+            queue_fatal_s=0.080,
+        )
+        processor = FakeProcessor()
+        events = []
+        capture = AecCapture(
+            config,
+            processor=processor,
+            source_factory=factory_for([], [])[0],
+            on_event=events.append,
+        )
+        capture._processor = processor
+
+        def audio(value: float, sequence: int) -> AudioBlock:
+            ended = 10.0 + sequence * config.block_duration_s
+            return AudioBlock(
+                (value,) * config.block_samples,
+                ended,
+                sequence=sequence,
+                callback_monotonic=ended,
+                observed_end_monotonic=ended,
+            )
+
+        capture._start_processing()
+        for sequence in range(3):
+            capture._enqueue_reference(audio(100.0 + sequence, sequence))
+            capture._enqueue_microphone(audio(200.0 + sequence, sequence))
+        deadline = time.monotonic() + 0.5
+        while len(processor.pairs) < 3 and time.monotonic() < deadline:
+            time.sleep(0.002)
+        self.assertEqual(len(processor.pairs), 3)
+
+        for sequence in range(3, 15):
+            capture._enqueue_microphone(audio(200.0 + sequence, sequence))
+            time.sleep(config.block_duration_s * 1.2)
+        deadline = time.monotonic() + 0.5
+        while (
+            capture.status().degraded_unpaired_microphone_blocks < 1
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.002)
+        capture.raise_if_failed()
+        capture._stop_processing()
+
+        status = capture.status()
+        self.assertEqual(status.synchronization_wait_timeout_count, 1)
+        self.assertGreaterEqual(status.degraded_unpaired_microphone_blocks, 1)
+        self.assertLessEqual(status.microphone_queue_s, config.queue_fatal_s)
+        retirements = [
+            event
+            for event in events
+            if event.kind == "synchronization_live_buffer_retired"
+        ]
+        self.assertEqual(len(retirements), 1)
+        self.assertFalse(retirements[0].details["raw_payload_preserved"])
+        degraded = [event for event in events if event.kind == "synchronization_degraded"]
+        self.assertEqual(len(degraded), 1)
+        self.assertEqual(degraded[0].details["effective_wait_limit_s"], 0.080)
 
     def test_capture_instance_cannot_be_restarted(self) -> None:
         factory, _sources = factory_for([(1.0, 0.02)], [(1.0, 0.02)])
@@ -1341,8 +1786,9 @@ class AecCaptureTests(unittest.TestCase):
             1,
         )
 
-    def test_one_source_stop_failure_does_not_skip_other_cleanup_or_summary(self) -> None:
+    def test_one_source_stop_failure_does_not_finalize_before_retry(self) -> None:
         sources = []
+        events = []
 
         def factory(_config, reference_callback, microphone_callback, _ref_device, _mic_device):
             reference = FakeSource(
@@ -1361,15 +1807,365 @@ class AecCaptureTests(unittest.TestCase):
                 output_dir=output,
                 processor=FakeProcessor(),
                 source_factory=factory,
+                on_event=events.append,
             )
             capture.start()
             with self.assertRaisesRegex(AudioBackendError, "reference stop failed"):
                 capture.stop()
 
             self.assertTrue(all(source.stopped for source in sources))
+            self.assertFalse((output / "summary.json").exists())
+            self.assertEqual(
+                [event.kind for event in events].count("capture_stopped"),
+                0,
+            )
+
+            sources[0].stop_error = None
+            capture.stop()
             summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["status"], "failed")
             self.assertIn("reference stop failed", summary["error"])
+            self.assertEqual(
+                [event.kind for event in events].count("capture_stopped"),
+                1,
+            )
+
+    def test_stop_retries_transient_cleanup_and_finalization_exactly_once(self) -> None:
+        class RetryReleaseSource(FakeSource):
+            def __init__(self, backend, callback, rows) -> None:
+                super().__init__(backend, callback, rows)
+                self.stop_calls = 0
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+                self.stopped = True
+                if self.stop_calls == 1:
+                    raise RuntimeError("transient reference release")
+
+        rows = [(1.0, 0.02), (2.0, 0.04), (3.0, 0.06)]
+        sources = []
+        events = []
+
+        def factory(
+            _config,
+            reference_callback,
+            microphone_callback,
+            _reference_device,
+            _microphone_device,
+        ):
+            reference = RetryReleaseSource(
+                "fake-reference",
+                reference_callback,
+                rows,
+            )
+            microphone = FakeSource("fake-microphone", microphone_callback, rows)
+            sources.extend((reference, microphone))
+            return reference, microphone
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "capture"
+            capture = AecCapture(
+                output_dir=output,
+                processor=FakeProcessor(),
+                source_factory=factory,
+                on_event=events.append,
+            )
+            capture.start()
+            artifacts = capture._artifacts
+            self.assertIsNotNone(artifacts)
+            assert artifacts is not None
+            failed_close = artifacts.microphone_aec.close
+            successful_close = artifacts.computer_audio.close
+            failed_close_calls = 0
+            successful_close_calls = 0
+
+            def fail_once() -> None:
+                nonlocal failed_close_calls
+                failed_close_calls += 1
+                if failed_close_calls == 1:
+                    raise RuntimeError("transient recorder close")
+                failed_close()
+
+            def track_successful_close() -> None:
+                nonlocal successful_close_calls
+                successful_close_calls += 1
+                successful_close()
+
+            try:
+                with (
+                    patch.object(
+                        artifacts.microphone_aec,
+                        "close",
+                        side_effect=fail_once,
+                    ),
+                    patch.object(
+                        artifacts.computer_audio,
+                        "close",
+                        side_effect=track_successful_close,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        AudioBackendError,
+                        "transient reference release",
+                    ):
+                        capture.stop(error="first primary error", status_name="failed")
+
+                    self.assertFalse((output / "summary.json").exists())
+                    with self.assertRaisesRegex(
+                        AudioBackendError,
+                        "transient recorder close",
+                    ):
+                        capture.stop(error="later stop error", status_name="completed")
+                    self.assertFalse((output / "summary.json").exists())
+                    capture.stop(error="third stop error", status_name="completed")
+
+                summary_path = output / "summary.json"
+                self.assertTrue(summary_path.is_file())
+                summary_bytes = summary_path.read_bytes()
+                summary = json.loads(summary_bytes)
+                self.assertEqual(sources[0].stop_calls, 2)
+                self.assertEqual(sources[1].stopped, True)
+                self.assertEqual(failed_close_calls, 2)
+                self.assertEqual(successful_close_calls, 1)
+                self.assertEqual(summary["status"], "failed")
+                self.assertEqual(summary["error"], "first primary error")
+                self.assertEqual(
+                    [event.kind for event in events].count("capture_stopped"),
+                    1,
+                )
+                self.assertEqual(len(list(output.glob("summary.json"))), 1)
+                self.assertTrue(
+                    all(track["frames"] == 2_880 for track in summary["tracks"].values())
+                )
+                self.assertTrue(
+                    all(
+                        track["frames"] == 2_880
+                        for track in summary["source_tracks"].values()
+                    )
+                )
+
+                capture.stop(error="fourth stop error", status_name="completed")
+                self.assertEqual(summary_path.read_bytes(), summary_bytes)
+                self.assertEqual(
+                    [event.kind for event in events].count("capture_stopped"),
+                    1,
+                )
+            finally:
+                if not artifacts.microphone_aec._closed:
+                    failed_close()
+                artifacts.events.close()
+
+    def test_stop_retries_a_still_live_processing_worker(self) -> None:
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+
+        def wait_for_release() -> None:
+            worker_started.set()
+            release_worker.wait(1.0)
+
+        capture = AecCapture(
+            processor=FakeProcessor(),
+            source_factory=factory_for([], [])[0],
+        )
+        capture._running = True
+        capture._ever_started = True
+        worker = threading.Thread(target=wait_for_release, daemon=True)
+        capture._processing_thread = worker
+        worker.start()
+        self.assertTrue(worker_started.wait(1.0))
+
+        try:
+            with (
+                patch.object(worker, "join", return_value=None),
+                self.assertRaisesRegex(
+                    AudioBackendError,
+                    "capture processing thread did not stop",
+                ),
+            ):
+                capture.stop()
+
+            self.assertIs(capture._processing_thread, worker)
+            release_worker.set()
+            capture.stop()
+            self.assertIsNone(capture._processing_thread)
+        finally:
+            release_worker.set()
+            worker.join(timeout=1.0)
+
+    def test_stop_retries_a_failed_stopped_event_before_finalizing(self) -> None:
+        rows = [(1.0, 0.02), (2.0, 0.04), (3.0, 0.06)]
+        events = []
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "capture"
+            capture = AecCapture(
+                output_dir=output,
+                processor=FakeProcessor(),
+                source_factory=factory_for(rows, rows)[0],
+                on_event=events.append,
+            )
+            capture.start()
+            artifacts = capture._artifacts
+            self.assertIsNotNone(artifacts)
+            assert artifacts is not None
+            original_write = artifacts.events.write
+            stopped_event_write_calls = 0
+
+            def fail_stopped_event_once(event) -> None:
+                nonlocal stopped_event_write_calls
+                if event.kind == "capture_stopped":
+                    stopped_event_write_calls += 1
+                    if stopped_event_write_calls == 1:
+                        raise RuntimeError("transient stopped event write")
+                original_write(event)
+
+            with patch.object(
+                artifacts.events,
+                "write",
+                side_effect=fail_stopped_event_once,
+            ):
+                with self.assertRaisesRegex(
+                    AudioBackendError,
+                    "transient stopped event write",
+                ):
+                    capture.stop()
+                self.assertFalse((output / "summary.json").exists())
+                capture.stop()
+
+            summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+            event_lines = [
+                json.loads(line)
+                for line in (output / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            stopped_lines = [line for line in event_lines if line["kind"] == "capture_stopped"]
+            self.assertEqual(stopped_event_write_calls, 2)
+            self.assertEqual(len(stopped_lines), 1)
+            self.assertEqual(
+                [event.kind for event in events].count("capture_stopped"),
+                1,
+            )
+            self.assertEqual(summary["event_count"], len(event_lines))
+
+    def test_stop_serializes_concurrent_and_reentrant_calls(self) -> None:
+        source_stop_entered = threading.Event()
+        release_source_stop = threading.Event()
+        second_stop_completed = threading.Event()
+        events = []
+        sources = []
+
+        class BlockingStopSource(FakeSource):
+            def __init__(self, backend, callback, rows) -> None:
+                super().__init__(backend, callback, rows)
+                self.stop_calls = 0
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+                source_stop_entered.set()
+                release_source_stop.wait(1.0)
+                self.stopped = True
+
+        rows = [(1.0, 0.02), (2.0, 0.04), (3.0, 0.06)]
+
+        def factory(
+            _config,
+            reference_callback,
+            microphone_callback,
+            _reference_device,
+            _microphone_device,
+        ):
+            reference = BlockingStopSource(
+                "fake-reference",
+                reference_callback,
+                rows,
+            )
+            microphone = FakeSource("fake-microphone", microphone_callback, rows)
+            sources.extend((reference, microphone))
+            return reference, microphone
+
+        capture: AecCapture
+
+        def on_event(event) -> None:
+            events.append(event)
+            if event.kind == "capture_stopped":
+                capture.stop(error="reentrant later error", status_name="completed")
+
+        capture = AecCapture(
+            processor=FakeProcessor(),
+            source_factory=factory,
+            on_event=on_event,
+        )
+        capture.start()
+
+        first = threading.Thread(target=capture.stop, daemon=True)
+
+        def stop_second() -> None:
+            capture.stop(error="concurrent later error", status_name="completed")
+            second_stop_completed.set()
+
+        second = threading.Thread(target=stop_second, daemon=True)
+        first.start()
+        self.assertTrue(source_stop_entered.wait(1.0))
+        second.start()
+
+        try:
+            self.assertFalse(second_stop_completed.wait(0.100))
+            release_source_stop.set()
+            first.join(timeout=1.0)
+            second.join(timeout=1.0)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertTrue(second_stop_completed.is_set())
+            self.assertEqual(sources[0].stop_calls, 1)
+            self.assertTrue(sources[1].stopped)
+            self.assertEqual(
+                [event.kind for event in events].count("capture_stopped"),
+                1,
+            )
+        finally:
+            release_source_stop.set()
+            first.join(timeout=1.0)
+            second.join(timeout=1.0)
+
+    def test_callback_queue_overflow_during_source_stop_is_failed_not_degraded(self) -> None:
+        rows = [(1.0, 0.02), (2.0, 0.04), (3.0, 0.06)]
+        sources = []
+        events = []
+
+        def factory(
+            _config,
+            reference_callback,
+            microphone_callback,
+            _reference_device,
+            _microphone_device,
+        ):
+            reference = ShutdownOverflowSource(
+                "windows-reference",
+                reference_callback,
+                rows,
+            )
+            microphone = FakeSource("windows-microphone", microphone_callback, rows)
+            sources.extend([reference, microphone])
+            return reference, microphone
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "capture"
+            capture = AecCapture(
+                output_dir=output,
+                processor=FakeProcessor(),
+                source_factory=factory,
+                on_event=events.append,
+            )
+            capture.start()
+            capture.stop()
+
+            summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+            stopped = [event for event in events if event.kind == "capture_stopped"]
+            self.assertEqual(len(stopped), 1)
+            self.assertEqual(stopped[0].details["status"], "failed")
+            self.assertEqual(summary["status"], "failed")
+            self.assertIn("callback queue overflow", summary["error"])
+            self.assertNotEqual(summary["status"], "degraded")
+            self.assertEqual(capture.status().reference_callback_queue_overflow_count, 1)
+            self.assertTrue(all(source.stopped for source in sources))
 
 
 if __name__ == "__main__":

@@ -46,6 +46,74 @@ class AdaptiveReferenceAlignerTests(unittest.TestCase):
         self.assertEqual([item.slot for item in update.mapped], [0, 1, 2])
         self.assertEqual(aligner.mode, AlignmentMode.LOCKED)
 
+    def test_startup_join_uses_newest_contiguous_microphone_tail(self) -> None:
+        aligner = AdaptiveReferenceAligner(0.020, 0.010)
+        microphones = tuple(
+            block(sequence, 1.000 + sequence * 0.020)
+            for sequence in range(83)
+        )
+        aligner.observe_microphone(microphones[0])
+        self.assertTrue(aligner.confirm_microphone_phase(microphones))
+        self.assertEqual(aligner.join_validation_microphone_sequence, 82)
+
+        updates = [
+            aligner.ingest_reference(
+                block(sequence, 1.000 + (80 + sequence) * 0.020)
+            )
+            for sequence in range(3)
+        ]
+
+        self.assertTrue(updates[-1].locks_alignment)
+        self.assertEqual(aligner.reference_offset, 80)
+        self.assertEqual([item.slot for item in updates[-1].mapped], [80, 81, 82])
+
+    def test_startup_join_rejects_reference_candidates_past_safe_microphone_tail(self) -> None:
+        aligner = AdaptiveReferenceAligner(0.020, 0.010)
+        microphones = tuple(
+            block(sequence, 1.000 + sequence * 0.020)
+            for sequence in range(83)
+        )
+        aligner.observe_microphone(microphones[0])
+        self.assertTrue(aligner.confirm_microphone_phase(microphones))
+
+        updates = [
+            aligner.ingest_reference(
+                block(sequence, 1.000 + (87 + sequence) * 0.020)
+            )
+            for sequence in range(3)
+        ]
+
+        self.assertFalse(any(update.locks_alignment for update in updates))
+        self.assertEqual(aligner.mode, AlignmentMode.JOINING)
+        self.assertIsNone(aligner.reference_offset)
+
+    def test_startup_join_does_not_bridge_a_queued_microphone_barrier(self) -> None:
+        aligner = AdaptiveReferenceAligner(0.020, 0.010)
+        microphones = (
+            *(
+                block(sequence, 1.000 + sequence * 0.020)
+                for sequence in range(83)
+            ),
+            block(83, 2.660, discontinuity=True),
+            block(84, 2.680),
+            block(85, 2.700),
+        )
+        aligner.observe_microphone(microphones[0])
+        self.assertTrue(aligner.confirm_microphone_phase(microphones))
+        self.assertEqual(aligner.join_validation_microphone_sequence, 82)
+        self.assertTrue(aligner.join_validation_microphone_barrier)
+
+        updates = [
+            aligner.ingest_reference(
+                block(sequence, 1.000 + (84 + sequence) * 0.020)
+            )
+            for sequence in range(3)
+        ]
+
+        self.assertFalse(any(update.locks_alignment for update in updates))
+        self.assertEqual(aligner.mode, AlignmentMode.JOINING)
+        self.assertIsNone(aligner.reference_offset)
+
     def test_observed_windows_flap_signature_never_changes_pair_identity(self) -> None:
         aligner = self.locked_aligner()
         corrections = []

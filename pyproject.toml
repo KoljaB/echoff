@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "echoff"
-version = "0.2.0"
+version = "0.3.0"
 description = "Echo off: real-time AEC with synchronized system-audio and microphone capture"
 readme = "README.md"
 license = "MIT"

@@ -185,6 +185,15 @@ class CaptureStatus:
     microphone_error: str | None = None
     error: str | None = None
     echo_path_reset_count: int = 0
+    startup_unpaired_microphone_blocks: int = 0
+    reference_queue_overflow_count: int = 0
+    microphone_queue_overflow_count: int = 0
+    reference_callback_queue_overflow_count: int = 0
+    microphone_callback_queue_overflow_count: int = 0
+    microphone_fallback_used: bool = False
+    microphone_backend_attempt_errors: tuple[str, ...] = ()
+    reference_callback_queue_high_watermark_packets: int = 0
+    microphone_callback_queue_high_watermark_packets: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

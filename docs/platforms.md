@@ -13,13 +13,15 @@ Echoff separates portable processing from platform-specific device capture.
 ## Windows
 
 System audio is captured from a WASAPI loopback endpoint through
-PyAudioWPatch. The microphone uses WASAPI and, when allowed, falls back to a
-matched (or sole) WDM-KS input through `sounddevice` if PortAudio cannot open
-it.
+PyAudioWPatch (`pyaudiowpatch_wasapi_loopback`). The microphone first uses
+WASAPI (`pyaudiowpatch_wasapi_microphone`). If that open fails and fallback is
+enabled, Echoff considers WDM-KS inputs through `sounddevice` only after a
+unique normalized physical-name match to the selected microphone and adopts the
+fallback only after `sounddevice_wdmks_microphone` starts successfully.
 
 The fallback is a runtime recovery path, not a separately selectable device in
-`echoff devices`. Selected backend, device name, and index are recorded in
-`summary.json`.
+`echoff devices`; a failed fallback start is never reported as selected. Selected
+backend, device name, and index are recorded in `summary.json`.
 
 Known operational boundaries:
 
@@ -32,12 +34,12 @@ Known operational boundaries:
 
 ## Linux
 
-The PipeWire backend captures a sink monitor as the render reference and an
-ordinary PipeWire source as the microphone. It uses the system `pactl` and
-`pw-record` tools, requests 48 kHz mono streams, emits fixed 20 ms blocks, and
-keeps monotonically increasing block-end timestamps on each stream's sample
-clock. `echoff devices` lists monitor sources as references and other sources
-as microphones.
+The PipeWire backend (`auto` or explicit `pipewire`) captures a sink monitor as
+the render reference and an ordinary PipeWire source as the microphone. It uses
+`pactl`, `pw-dump`, and `pw-record`, requests fixed 48 kHz mono streams, emits
+fixed 20 ms blocks, and keeps monotonically increasing block-end timestamps on
+each stream's sample clock. `echoff devices` lists monitor sources as references
+and other sources as microphones.
 
 The selected output monitor must correspond to the physical output that can
 reach the selected microphone. Select explicit devices when PipeWire's default
@@ -65,6 +67,7 @@ where the LiveKit WebRTC APM dependency is available, but the host must supply
 48 kHz mono PCM and honor the alignment/ordering contract. Code availability is
 not the same as a physically qualified platform integration.
 
-`AecConfig(backend="auto")` selects WASAPI on Windows and PipeWire on Linux.
+`AecConfig(backend="auto")` selects WASAPI on Windows and PipeWire on Linux;
+macOS has no built-in device backend.
 
 Next: [Integration](integration.md) · [Architecture](architecture.md)

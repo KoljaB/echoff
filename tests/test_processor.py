@@ -247,24 +247,30 @@ class WebRtcAecProcessorTests(unittest.TestCase):
         processor.process_reference([0.2] * 240)
         self.assertEqual(FakeApm.instances[-1].calls, [])
 
-    def test_streaming_echo_path_reset_requires_synchronized_boundary(self) -> None:
+    def test_streaming_echo_path_reset_discards_pre_reset_state(self) -> None:
         processor = StreamingWebRtcAecProcessor(
             AecConfig(),
             _rtc=FakeRtc,
             _apm_type=FakeApm,
         )
         processor.process_reference([0.2] * 480)
+        processor.process_microphone([0.1] * 240)
         current_apm = FakeApm.instances[-1]
 
-        with self.assertRaisesRegex(RuntimeError, "synchronized boundary"):
-            processor.reset_echo_path()
-        self.assertIs(FakeApm.instances[-1], current_apm)
-        self.assertEqual(processor.state.echo_path_reset_count, 0)
-
-        processor.process_microphone([0.1] * 480)
         processor.reset_echo_path()
         self.assertIsNot(FakeApm.instances[-1], current_apm)
         self.assertEqual(processor.state.echo_path_reset_count, 1)
+        processor.process_reference([0.0] * 240)
+        output = processor.process_microphone([0.1] * 240)
+        self.assertEqual(output, ())
+        self.assertEqual(FakeApm.instances[-1].calls, [])
+        processor.process_reference([0.0] * 240)
+        output = processor.process_microphone([0.1] * 240)
+        self.assertEqual(len(output), 480)
+        self.assertEqual(FakeApm.instances[-1].calls, ["reference", "microphone"])
+        self.assertEqual(processor.state.far_end_active_s, 0.0)
+        self.assertEqual(processor.state.alignment_epoch, 0)
+        self.assertEqual(processor.state.stream_alignment_reset_count, 0)
 
     def test_buffered_pairs_interleave_frames_and_flush_exact_tail(self) -> None:
         processor = BufferedWebRtcAecProcessor(
@@ -288,7 +294,7 @@ class WebRtcAecProcessorTests(unittest.TestCase):
             ],
         )
 
-    def test_echo_path_reset_preserves_buffered_pair_tail(self) -> None:
+    def test_echo_path_reset_discards_buffered_pair_tail(self) -> None:
         processor = BufferedWebRtcAecProcessor(
             AecConfig(),
             _rtc=FakeRtc,
@@ -299,6 +305,9 @@ class WebRtcAecProcessorTests(unittest.TestCase):
         processor.reset_echo_path()
         output = processor.process_pair([0.2] * 240, [0.1] * 240)
 
+        self.assertEqual(output, ())
+        self.assertEqual(FakeApm.instances[-1].calls, [])
+        output = processor.process_pair([0.2] * 240, [0.1] * 240)
         self.assertEqual(len(output), 480)
         self.assertEqual(FakeApm.instances[-1].calls, ["reference", "microphone"])
         self.assertEqual(processor.state.alignment_epoch, 0)

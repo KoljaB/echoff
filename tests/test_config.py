@@ -17,7 +17,7 @@ class AecConfigTests(unittest.TestCase):
         self.assertEqual(config.block_samples, 960)
         self.assertEqual(config.apm_frame_samples, 480)
         self.assertEqual(config.stream_delay_ms, 50)
-        self.assertEqual(config.reference_stall_grace_s, 15.0)
+        self.assertEqual(config.reference_stall_grace_s, 3.0)
         self.assertEqual(config.echo_path_warmup_s, 7.5)
         self.assertEqual(config.far_end_active_rms_min, 0.001)
         self.assertEqual(config.echo_path_quality_window_s, 1.0)

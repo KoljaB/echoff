@@ -9,7 +9,7 @@ PATH.
 
 ## `devices`
 
-List selectable WASAPI loopback and microphone devices:
+List selectable devices for the current platform:
 
 ```powershell
 python -m echoff devices
@@ -17,9 +17,12 @@ python -m echoff devices --json
 ```
 
 Defaults are marked in text output. JSON emits `DeviceInfo.to_dict()` rows.
-Only WASAPI devices are selectable. The optional WDM-KS microphone fallback is
-matched automatically after a selected WASAPI microphone fails to open; it is
-not a second CLI device namespace.
+On Windows, the list contains WASAPI loopback references and WASAPI microphones;
+the optional WDM-KS microphone fallback is selected only after a unique
+normalized physical-name match and successful start, and is hidden from this
+list. On Linux, the list contains PipeWire sink monitors and ordinary sources.
+`AecConfig(backend="auto")` chooses the platform backend; `record` has no
+`--backend` flag.
 
 ## `record`
 
@@ -51,7 +54,8 @@ automatic far-end-only analysis. These are reproducible process-timing windows,
 not sample-accurate sound-card boundaries.
 
 An existing non-empty output directory is rejected. Echoff never overwrites a
-prior capture.
+prior capture. If the finalized summary is `incomplete`, `degraded`, or
+`failed`, the command reports failure while retaining the artifact directory.
 
 ## `analyze`
 

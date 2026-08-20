@@ -38,12 +38,24 @@ def write_json_atomic(path: Path, value: Any) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     if path.exists() or temporary.exists():
         raise FileExistsError(path if path.exists() else temporary)
-    payload = canonical_json_bytes(value, pretty=True)
-    with temporary.open("xb") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.rename(temporary, path)
+    created_temporary = False
+    try:
+        payload = canonical_json_bytes(value, pretty=True)
+        with temporary.open("xb") as handle:
+            created_temporary = True
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.rename(temporary, path)
+    except Exception:
+        if created_temporary:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        raise
 
 
 class PcmWavRecorder:
@@ -56,6 +68,8 @@ class PcmWavRecorder:
         self.sample_count = 0
         self._lock = threading.Lock()
         self._closed = False
+        self._wave_closed = False
+        self._raw_closed = False
         self._raw = path.open("xb")
         try:
             # This writer intentionally stays open for the recorder lifetime.
@@ -85,8 +99,12 @@ class PcmWavRecorder:
         with self._lock:
             if self._closed:
                 return
-            self._wave.close()
-            self._raw.close()
+            if not self._wave_closed:
+                self._wave.close()
+                self._wave_closed = True
+            if not self._raw_closed:
+                self._raw.close()
+                self._raw_closed = True
             self._closed = True
 
 
@@ -199,6 +217,11 @@ class CaptureArtifacts:
             self.reference_received,
             self.microphone_received,
         ) = recorders
+        self._recorders = tuple(recorders)
+        self._closed_recorder_ids: set[int] = set()
+        self._finalize_lock = threading.RLock()
+        self._events_closed = False
+        self._summary_written = False
         self._closed = False
 
     def write_pair(
@@ -224,23 +247,29 @@ class CaptureArtifacts:
         self.microphone_received.write(microphone)
 
     def close_tracks(self) -> None:
-        if self._closed:
+        with self._finalize_lock:
+            if self._closed:
+                return
+            errors: list[Exception] = []
+            for recorder in self._recorders:
+                recorder_id = id(recorder)
+                if recorder_id in self._closed_recorder_ids:
+                    continue
+                try:
+                    recorder.close()
+                except Exception as exc:
+                    errors.append(exc)
+                else:
+                    self._closed_recorder_ids.add(recorder_id)
+            self._closed = len(self._closed_recorder_ids) == len(self._recorders)
+            if errors:
+                raise errors[0]
+
+    def _close_events(self) -> None:
+        if self._events_closed:
             return
-        errors: list[Exception] = []
-        for recorder in (
-            self.computer_audio,
-            self.microphone_raw,
-            self.microphone_aec,
-            self.reference_received,
-            self.microphone_received,
-        ):
-            try:
-                recorder.close()
-            except Exception as exc:
-                errors.append(exc)
-        self._closed = True
-        if errors:
-            raise errors[0]
+        self.events.close()
+        self._events_closed = True
 
     @staticmethod
     def _sha256(path: Path) -> str:
@@ -278,31 +307,36 @@ class CaptureArtifacts:
         metadata: dict[str, Any],
         timeline_started_monotonic: float | None,
     ) -> Path:
-        self.close_tracks()
-        tracks = {
-            name: self._wav_metadata(self.output_dir / f"{name}.wav") for name in self.TRACK_NAMES
-        }
-        source_tracks = {
-            name: self._wav_metadata(self.output_dir / f"{name}.wav")
-            for name in self.SOURCE_TRACK_NAMES
-        }
-        frame_counts = {int(track["frames"]) for track in tracks.values()}
-        summary = {
-            "schema_version": ARTIFACT_SCHEMA,
-            "status": status_name,
-            "started_utc": started_utc,
-            "ended_utc": ended_utc,
-            "duration_s": duration_s,
-            "timeline_started_monotonic": timeline_started_monotonic,
-            "capture": capture_status.to_dict(),
-            "tracks": tracks,
-            "source_tracks": source_tracks,
-            "tracks_share_timeline": len(frame_counts) == 1,
-            "event_count": self.events.count,
-            "metadata": metadata,
-            "error": error,
-        }
-        self.events.close()
         path = self.output_dir / "summary.json"
-        write_json_atomic(path, summary)
-        return path
+        with self._finalize_lock:
+            if self._summary_written:
+                return path
+            self.close_tracks()
+            tracks = {
+                name: self._wav_metadata(self.output_dir / f"{name}.wav")
+                for name in self.TRACK_NAMES
+            }
+            source_tracks = {
+                name: self._wav_metadata(self.output_dir / f"{name}.wav")
+                for name in self.SOURCE_TRACK_NAMES
+            }
+            frame_counts = {int(track["frames"]) for track in tracks.values()}
+            summary = {
+                "schema_version": ARTIFACT_SCHEMA,
+                "status": status_name,
+                "started_utc": started_utc,
+                "ended_utc": ended_utc,
+                "duration_s": duration_s,
+                "timeline_started_monotonic": timeline_started_monotonic,
+                "capture": capture_status.to_dict(),
+                "tracks": tracks,
+                "source_tracks": source_tracks,
+                "tracks_share_timeline": len(frame_counts) == 1,
+                "event_count": self.events.count,
+                "metadata": metadata,
+                "error": error,
+            }
+            self._close_events()
+            write_json_atomic(path, summary)
+            self._summary_written = True
+            return path

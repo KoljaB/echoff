@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import queue
 import sys
 import threading
@@ -12,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .alignment import AdaptiveReferenceAligner, AlignmentMode, AlignmentUpdate
 from .backends import create_sources
@@ -129,8 +130,18 @@ class AecCapture:
         self._source_factory = source_factory or _default_source_factory
         self._reference: CaptureSource | None = None
         self._microphone: CaptureSource | None = None
-        self._reference_queue: queue.Queue[AudioBlock] = queue.Queue()
-        self._microphone_queue: queue.Queue[AudioBlock] = queue.Queue()
+        self._capture_queue_capacity_blocks = max(
+            1,
+            math.ceil(self.config.queue_fatal_s / self.config.block_duration_s),
+        )
+        self._reference_queue: queue.Queue[AudioBlock] = queue.Queue(
+            maxsize=self._capture_queue_capacity_blocks
+        )
+        self._microphone_queue: queue.Queue[AudioBlock] = queue.Queue(
+            maxsize=self._capture_queue_capacity_blocks
+        )
+        self._reference_queue_overflow_count = 0
+        self._microphone_queue_overflow_count = 0
         self._processing_stop = threading.Event()
         self._startup_ready = threading.Event()
         self._processing_thread: threading.Thread | None = None
@@ -141,6 +152,22 @@ class AecCapture:
         )
         self._artifacts: CaptureArtifacts | None = None
         self._state_lock = threading.RLock()
+        self._stop_condition = threading.Condition(threading.RLock())
+        self._stop_in_progress = False
+        self._stop_owner_thread_id: int | None = None
+        self._stop_retry_scheduled = False
+        self._stop_request_recorded = False
+        self._stop_requested_error: str | None = None
+        self._stop_requested_status_name: str | None = None
+        self._stop_sources_initialized = False
+        self._stop_pending_source_names: set[str] = set()
+        self._stop_first_cleanup_error: Exception | None = None
+        self._stop_terminal_decided = False
+        self._stop_terminal_error: str | None = None
+        self._stop_terminal_status: str | None = None
+        self._stop_event_emitted = False
+        self._stop_artifacts_finalized = False
+        self._stop_complete = False
         self._running = False
         self._ever_started = False
         self._started_monotonic: float | None = None
@@ -229,20 +256,55 @@ class AecCapture:
                     self._reference.activate()
                 except Exception as exc:
                     self._note_reference_failure(phase="activate", error=exc)
-            if not self._startup_ready.wait(self.config.startup_timeout_s):
+            startup_deadline = time.monotonic() + self.config.startup_timeout_s
+            self._wait_for_source_active(
+                self._microphone,
+                source_kind="microphone",
+                deadline=startup_deadline,
+            )
+            if reference_prepared:
+                self._wait_for_source_active(
+                    self._reference,
+                    source_kind="reference",
+                    deadline=startup_deadline,
+                )
+            startup_remaining_s = max(0.0, startup_deadline - time.monotonic())
+            if not self._startup_ready.wait(startup_remaining_s):
                 raise AudioBackendError("capture streams did not produce any startup audio")
             self.raise_if_failed()
+            startup_degraded = (
+                self._reference_failure is not None
+                or self._microphone_failure is not None
+            )
+            microphone_diagnostics = self._source_diagnostics(self._microphone)
             self._emit(
-                "capture_ready",
+                "capture_degraded_ready" if startup_degraded else "capture_ready",
                 reference_backend=self._reference.backend_name,
                 reference_device_name=self._reference.selected_device_name,
                 reference_device_index=self._reference.selected_device_index,
                 microphone_backend=self._microphone.backend_name,
                 microphone_device_name=self._microphone.selected_device_name,
                 microphone_device_index=self._microphone.selected_device_index,
+                reference_error=(
+                    None
+                    if self._reference_failure is None
+                    else str(self._reference_failure)
+                ),
+                microphone_error=(
+                    None
+                    if self._microphone_failure is None
+                    else str(self._microphone_failure)
+                ),
+                microphone_fallback_used=microphone_diagnostics.get(
+                    "fallback_used", False
+                ),
+                microphone_backend_attempt_errors=microphone_diagnostics.get(
+                    "backend_attempt_errors", ()
+                ),
             )
             LOGGER.info(
-                "capture ready: reference=%s microphone=%s",
+                "%s: reference=%s microphone=%s",
+                "capture degraded" if startup_degraded else "capture ready",
                 self._reference.selected_device_name,
                 self._microphone.selected_device_name,
             )
@@ -255,6 +317,64 @@ class AecCapture:
             except Exception:
                 LOGGER.exception("capture startup cleanup also failed")
             raise
+
+    def _wait_for_source_active(
+        self,
+        source: CaptureSource,
+        *,
+        source_kind: str,
+        deadline: float,
+    ) -> bool:
+        """Wait for built-in backends to publish active device metadata."""
+
+        active_event = getattr(source, "active_event", None)
+        wait = getattr(active_event, "wait", None)
+        if not callable(wait):
+            return True
+        while True:
+            if wait(0.010):
+                return True
+            if source.error is not None:
+                if source_kind == "reference":
+                    self._note_reference_failure(phase="start", error=source.error)
+                else:
+                    self._note_microphone_failure(phase="start", error=source.error)
+                return False
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0.0:
+                failure = AudioBackendError(
+                    f"{source_kind} source did not become active before startup timeout"
+                )
+                if source_kind == "reference":
+                    self._note_reference_failure(phase="start", error=failure)
+                else:
+                    self._note_microphone_failure(phase="start", error=failure)
+                return False
+
+    @staticmethod
+    def _source_diagnostics(
+        source: CaptureSource | None,
+    ) -> dict[str, int | float | bool | tuple[str, ...]]:
+        if source is None:
+            return {}
+        snapshot = getattr(source, "diagnostics_snapshot", None)
+        if callable(snapshot):
+            return cast(
+                dict[str, int | float | bool | tuple[str, ...]],
+                snapshot(),
+            )
+        return {}
+
+    @staticmethod
+    def _source_diagnostic_value(
+        source: CaptureSource | None,
+        diagnostics: dict[str, int | float | bool | tuple[str, ...]],
+        name: str,
+        default: Any,
+    ) -> Any:
+        if name in diagnostics:
+            return diagnostics[name]
+        return default if source is None else getattr(source, name, default)
 
     @property
     def started_monotonic(self) -> float | None:
@@ -285,70 +405,252 @@ class AecCapture:
                 raise CaptureStateError("capture is not running")
             if self._processor is None:
                 raise CaptureStateError("capture processor is not initialized")
-            self._processor.reset_echo_path()
+            reset = getattr(self._processor, "reset_echo_path", None)
+            if not callable(reset):
+                raise CaptureStateError(
+                    "capture processor does not support echo-path reset"
+                )
+            reset()
             state = self._processor.state
         self._emit(
             "echo_path_reset",
-            echo_path_reset_count=state.echo_path_reset_count,
+            echo_path_reset_count=getattr(state, "echo_path_reset_count", 0),
             alignment_epoch=state.alignment_epoch,
         )
 
     def stop(self, *, error: str | None = None, status_name: str | None = None) -> None:
+        """Stop once, retrying only cleanup work left by an earlier attempt."""
+
+        if self._is_processing_worker():
+            self._request_stop_from_processing_worker(error, status_name)
+            return
+
+        owner_thread_id = threading.get_ident()
+        with self._stop_condition:
+            while True:
+                if self._stop_complete:
+                    return
+                if self._stop_in_progress:
+                    if self._stop_owner_thread_id == owner_thread_id:
+                        return
+                    self._stop_condition.wait()
+                    continue
+                with self._state_lock:
+                    if not self._running and not self._ever_started:
+                        return
+                    self._running = False
+                self._record_stop_request_locked(error, status_name)
+                self._stop_in_progress = True
+                self._stop_owner_thread_id = owner_thread_id
+                break
+
+        try:
+            self._stop_once()
+        finally:
+            with self._stop_condition:
+                self._stop_in_progress = False
+                self._stop_owner_thread_id = None
+                self._stop_condition.notify_all()
+
+    def _is_processing_worker(self) -> bool:
         with self._state_lock:
-            if not self._running:
+            return self._processing_thread is threading.current_thread()
+
+    def _request_stop_from_processing_worker(
+        self,
+        error: str | None,
+        status_name: str | None,
+    ) -> None:
+        """Avoid making the pairing thread wait for its own join."""
+
+        launch_retry = False
+        with self._stop_condition:
+            if self._stop_complete:
                 return
-            self._running = False
+            self._record_stop_request_locked(error, status_name)
+            if not self._stop_retry_scheduled:
+                self._stop_retry_scheduled = True
+                launch_retry = True
+        self._processing_stop.set()
+        if launch_retry:
+            threading.Thread(
+                target=self._retry_stop_after_processing_callback,
+                name="echoff-stop-finalizer",
+                daemon=True,
+            ).start()
+
+    def _retry_stop_after_processing_callback(self) -> None:
+        try:
+            self.stop()
+        except Exception:
+            LOGGER.exception("capture stop requested from processing callback failed")
+        finally:
+            with self._stop_condition:
+                self._stop_retry_scheduled = False
+
+    def _record_stop_request_locked(
+        self,
+        error: str | None,
+        status_name: str | None,
+    ) -> None:
+        if self._stop_request_recorded:
+            return
+        self._stop_request_recorded = True
+        self._stop_requested_error = error
+        self._stop_requested_status_name = status_name
+
+    def _stop_once(self) -> None:
         cleanup_errors: list[Exception] = []
+        self._initialize_pending_source_stops()
         for label, source in (
             ("reference", self._reference),
             ("microphone", self._microphone),
         ):
+            if label not in self._stop_pending_source_names:
+                continue
             if source is None:
+                self._stop_pending_source_names.discard(label)
                 continue
             try:
                 source.stop()
             except Exception as exc:
                 LOGGER.exception("%s source cleanup failed", label)
+                self._remember_stop_cleanup_error(exc)
                 cleanup_errors.append(exc)
-        try:
-            self._stop_processing()
-        except Exception as exc:
-            LOGGER.exception("capture processing cleanup failed")
-            cleanup_errors.append(exc)
-        effective_error = error
+            else:
+                self._stop_pending_source_names.discard(label)
+
+        worker_joined = self._stop_processing()
+        if not worker_joined:
+            worker_error = self._processing_error
+            if worker_error is None:  # pragma: no cover - defensive fallback
+                worker_error = AudioBackendError("capture processing thread did not stop")
+            self._remember_stop_cleanup_error(worker_error)
+            cleanup_errors.append(worker_error)
+
+        if worker_joined and not self._stop_pending_source_names:
+            self._freeze_stop_terminal()
+            self._emit_stop_event_once(cleanup_errors)
+            if self._stop_event_emitted:
+                self._finalize_stop_artifacts(cleanup_errors)
+
+        if self._stop_lifecycle_complete():
+            with self._stop_condition:
+                self._stop_complete = True
+            LOGGER.info("capture stopped: status=%s", self._stop_terminal_status)
+
+        if cleanup_errors:
+            raise AudioBackendError(
+                f"capture cleanup failed: {cleanup_errors[0]}"
+            ) from cleanup_errors[0]
+
+    def _initialize_pending_source_stops(self) -> None:
+        if self._stop_sources_initialized:
+            return
+        self._stop_sources_initialized = True
+        if self._reference is not None:
+            self._stop_pending_source_names.add("reference")
+        if self._microphone is not None:
+            self._stop_pending_source_names.add("microphone")
+
+    def _remember_stop_cleanup_error(self, error: Exception) -> None:
+        if self._stop_first_cleanup_error is None:
+            self._stop_first_cleanup_error = error
+
+    def _freeze_stop_terminal(self) -> None:
+        if self._stop_terminal_decided:
+            return
+        effective_error = self._stop_requested_error
         if effective_error is None:
             try:
                 self.raise_if_failed()
             except Exception as exc:
                 effective_error = str(exc)
-        if effective_error is None and cleanup_errors:
-            effective_error = f"capture cleanup failed: {cleanup_errors[0]}"
-        final_name = status_name or ("failed" if effective_error else "completed")
+        if effective_error is None and self._stop_first_cleanup_error is not None:
+            effective_error = f"capture cleanup failed: {self._stop_first_cleanup_error}"
+        self._stop_terminal_error = effective_error
+        self._stop_terminal_status = self._derive_terminal_status(effective_error)
+        self._stop_terminal_decided = True
+
+    def _derive_terminal_status(self, effective_error: str | None) -> str:
+        reference_blocks = (
+            0 if self._reference is None else self._reference.device_block_count
+        )
+        microphone_blocks = (
+            0 if self._microphone is None else self._microphone.device_block_count
+        )
+        incomplete = (
+            reference_blocks <= 0
+            or microphone_blocks <= 0
+            or self._processed_slot_count <= 0
+            or self._aligner.mode is not AlignmentMode.LOCKED
+        )
+        degraded = (
+            self._reference_failure is not None
+            or self._microphone_failure is not None
+            or self._aligner.mode is AlignmentMode.DEGRADED
+        )
+        if effective_error is not None:
+            return "failed"
+        if (
+            self._stop_requested_status_name is not None
+            and self._stop_requested_status_name != "completed"
+        ):
+            return self._stop_requested_status_name
+        if degraded:
+            return "degraded"
+        if incomplete:
+            return "incomplete"
+        return "completed"
+
+    def _emit_stop_event_once(self, cleanup_errors: list[Exception]) -> None:
+        if self._stop_event_emitted:
+            return
         try:
-            self._emit("capture_stopped", status=final_name, error=effective_error)
+            self._emit(
+                "capture_stopped",
+                status=self._stop_terminal_status,
+                error=self._stop_terminal_error,
+            )
         except Exception as exc:
             LOGGER.exception("capture stop event could not be written")
             cleanup_errors.append(exc)
-        if self._artifacts is not None and self._started_monotonic is not None:
-            try:
-                self._artifacts.finalize(
-                    status_name=final_name,
-                    capture_status=self.status(),
-                    started_utc=self._started_utc or _utc_now(),
-                    ended_utc=_utc_now(),
-                    duration_s=max(0.0, time.monotonic() - self._started_monotonic),
-                    error=effective_error,
-                    metadata=dict(self._summary_metadata),
-                    timeline_started_monotonic=self._timeline_started_monotonic,
-                )
-            except Exception as exc:
-                LOGGER.exception("capture artifact finalization failed")
-                cleanup_errors.append(exc)
-        LOGGER.info("capture stopped: status=%s", final_name)
-        if cleanup_errors:
-            raise AudioBackendError(
-                f"capture cleanup failed: {cleanup_errors[0]}"
-            ) from cleanup_errors[0]
+        else:
+            self._stop_event_emitted = True
+
+    def _finalize_stop_artifacts(self, cleanup_errors: list[Exception]) -> None:
+        if self._stop_artifacts_finalized:
+            return
+        if self._artifacts is None or self._started_monotonic is None:
+            self._stop_artifacts_finalized = True
+            return
+        try:
+            self._artifacts.finalize(
+                status_name=self._stop_terminal_status or "failed",
+                capture_status=self.status(),
+                started_utc=self._started_utc or _utc_now(),
+                ended_utc=_utc_now(),
+                duration_s=max(0.0, time.monotonic() - self._started_monotonic),
+                error=self._stop_terminal_error,
+                metadata=dict(self._summary_metadata),
+                timeline_started_monotonic=self._timeline_started_monotonic,
+            )
+        except Exception as exc:
+            LOGGER.exception("capture artifact finalization failed")
+            cleanup_errors.append(exc)
+        else:
+            self._stop_artifacts_finalized = True
+
+    def _stop_lifecycle_complete(self) -> bool:
+        with self._state_lock:
+            worker_joined = self._processing_thread is None
+        return (
+            not self._stop_pending_source_names
+            and worker_joined
+            and self._stop_terminal_decided
+            and self._stop_event_emitted
+            and self._stop_artifacts_finalized
+        )
 
     def set_summary_metadata(self, **values: Any) -> None:
         """Add JSON-compatible application metadata before capture stops."""
@@ -369,18 +671,51 @@ class AecCapture:
         if self._processing_error is not None:
             raise AudioBackendError(f"capture processing failed: {self._processing_error}")
         reference_queue_s, microphone_queue_s = self._pending_audio_seconds()
-        safely_spooling_degraded = (
+        worker_manages_degraded_backlog = (
             self._aligner.mode is AlignmentMode.DEGRADED
-            and self._artifacts is not None
+            and self._processing_thread is not None
+            and self._processing_thread.is_alive()
         )
         if (
-            not safely_spooling_degraded
+            not worker_manages_degraded_backlog
             and max(reference_queue_s, microphone_queue_s) > self.config.queue_fatal_s
         ):
             raise AudioBackendError(
                 "capture processing backlog exceeded the configured fatal limit: "
                 f"reference={reference_queue_s:.3f}s microphone={microphone_queue_s:.3f}s"
             )
+        reference_diagnostics = self._source_diagnostics(self._reference)
+        microphone_diagnostics = self._source_diagnostics(self._microphone)
+        reference_callback_queue_overflows = int(
+            self._source_diagnostic_value(
+                self._reference,
+                reference_diagnostics,
+                "callback_queue_overflow_count",
+                0,
+            )
+            or 0
+        )
+        microphone_callback_queue_overflows = int(
+            self._source_diagnostic_value(
+                self._microphone,
+                microphone_diagnostics,
+                "callback_queue_overflow_count",
+                0,
+            )
+            or 0
+        )
+        if reference_callback_queue_overflows or microphone_callback_queue_overflows:
+            prior_failure = self._reference_failure or self._microphone_failure
+            overflow_error = AudioBackendError(
+                "capture callback queue overflow: "
+                f"reference={reference_callback_queue_overflows} "
+                f"microphone={microphone_callback_queue_overflows}"
+            )
+            if prior_failure is not None:
+                raise AudioBackendError(
+                    f"{prior_failure}; {overflow_error}"
+                ) from prior_failure
+            raise overflow_error
 
     def status(self) -> CaptureStatus:
         snapshot = self._aligner.snapshot
@@ -389,15 +724,41 @@ class AecCapture:
         )
         reference = self._reference
         microphone = self._microphone
+        reference_diagnostics = self._source_diagnostics(reference)
+        microphone_diagnostics = self._source_diagnostics(microphone)
         reference_failure = self._reference_failure
         if reference_failure is None and reference is not None:
             reference_failure = reference.error
         microphone_failure = self._microphone_failure
         if microphone_failure is None and microphone is not None:
             microphone_failure = microphone.error
+        reference_callback_queue_overflows = int(
+            self._source_diagnostic_value(
+                reference,
+                reference_diagnostics,
+                "callback_queue_overflow_count",
+                0,
+            )
+            or 0
+        )
+        microphone_callback_queue_overflows = int(
+            self._source_diagnostic_value(
+                microphone,
+                microphone_diagnostics,
+                "callback_queue_overflow_count",
+                0,
+            )
+            or 0
+        )
         errors: list[str] = []
         if self._processing_error is not None:
             errors.append(f"capture processing failed: {self._processing_error}")
+        if reference_callback_queue_overflows or microphone_callback_queue_overflows:
+            errors.append(
+                "capture callback queue overflow: "
+                f"reference={reference_callback_queue_overflows} "
+                f"microphone={microphone_callback_queue_overflows}"
+            )
         pair_count = snapshot.pair_count
         return CaptureStatus(
             running=self._running,
@@ -441,139 +802,157 @@ class AecCapture:
             microphone_device_index=(
                 None if microphone is None else microphone.selected_device_index
             ),
-            reference_device_blocks=(0 if reference is None else reference.device_block_count),
-            reference_silence_blocks=(
-                0 if reference is None else reference.synthetic_silence_block_count
+            reference_device_blocks=self._source_diagnostic_value(
+                reference, reference_diagnostics, "device_block_count", 0
             ),
-            reference_dropped_device_blocks=(
-                0 if reference is None else reference.dropped_device_block_count
+            reference_silence_blocks=self._source_diagnostic_value(
+                reference,
+                reference_diagnostics,
+                "synthetic_silence_block_count",
+                0,
             ),
-            reference_timestamp_regressions=(
-                0 if reference is None else reference.timestamp_regression_count
+            reference_dropped_device_blocks=self._source_diagnostic_value(
+                reference,
+                reference_diagnostics,
+                "dropped_device_block_count",
+                0,
             ),
-            reference_invalid_timestamps=(
-                0 if reference is None else reference.invalid_timestamp_count
+            reference_timestamp_regressions=self._source_diagnostic_value(
+                reference, reference_diagnostics, "timestamp_regression_count", 0
             ),
-            reference_timestamp_deviation_max_ms=(
-                0.0 if reference is None else 1000.0 * reference.timestamp_deviation_max_s
+            reference_invalid_timestamps=self._source_diagnostic_value(
+                reference, reference_diagnostics, "invalid_timestamp_count", 0
             ),
-            reference_timestamp_gap_blocks=(
-                0 if reference is None else getattr(reference, "timestamp_gap_block_count", 0)
+            reference_timestamp_deviation_max_ms=1000.0
+            * self._source_diagnostic_value(
+                reference, reference_diagnostics, "timestamp_deviation_max_s", 0.0
             ),
-            reference_timestamp_anomalies=(
-                0 if reference is None else getattr(reference, "timestamp_anomaly_count", 0)
+            reference_timestamp_gap_blocks=self._source_diagnostic_value(
+                reference, reference_diagnostics, "timestamp_gap_block_count", 0
             ),
-            reference_callback_status_count=(
-                0 if reference is None else getattr(reference, "callback_status_count", 0)
+            reference_timestamp_anomalies=self._source_diagnostic_value(
+                reference, reference_diagnostics, "timestamp_anomaly_count", 0
             ),
-            reference_input_overflow_count=(
-                0 if reference is None else getattr(reference, "input_overflow_count", 0)
+            reference_callback_status_count=self._source_diagnostic_value(
+                reference, reference_diagnostics, "callback_status_count", 0
             ),
-            reference_input_underflow_count=(
-                0 if reference is None else getattr(reference, "input_underflow_count", 0)
+            reference_input_overflow_count=self._source_diagnostic_value(
+                reference, reference_diagnostics, "input_overflow_count", 0
             ),
-            reference_padded_samples=(
-                0 if reference is None else getattr(reference, "padded_sample_count", 0)
+            reference_input_underflow_count=self._source_diagnostic_value(
+                reference, reference_diagnostics, "input_underflow_count", 0
             ),
-            reference_callback_packet_count=(
-                0 if reference is None else getattr(reference, "callback_packet_count", 0)
+            reference_padded_samples=self._source_diagnostic_value(
+                reference, reference_diagnostics, "padded_sample_count", 0
             ),
-            reference_callback_payload_frames=(
+            reference_callback_packet_count=self._source_diagnostic_value(
+                reference, reference_diagnostics, "callback_packet_count", 0
+            ),
+            reference_callback_payload_frames=self._source_diagnostic_value(
+                reference, reference_diagnostics, "callback_payload_frame_count", 0
+            ),
+            reference_callback_queue_high_watermark_blocks=self._source_diagnostic_value(
+                reference,
+                reference_diagnostics,
+                "callback_queue_high_watermark_blocks",
                 0
                 if reference is None
-                else getattr(reference, "callback_payload_frame_count", 0)
+                else getattr(reference, "callback_queue_high_watermark", 0),
             ),
-            reference_callback_queue_high_watermark_blocks=(
+            reference_callback_queue_age_max_ms=1000.0
+            * self._source_diagnostic_value(
+                reference, reference_diagnostics, "callback_queue_age_max_s", 0.0
+            ),
+            reference_callback_enqueue_max_ms=1000.0
+            * self._source_diagnostic_value(
+                reference, reference_diagnostics, "callback_enqueue_max_s", 0.0
+            ),
+            reference_callback_timeline_drift_ms=1000.0
+            * self._source_diagnostic_value(
+                reference, reference_diagnostics, "callback_timeline_drift_s", 0.0
+            ),
+            reference_callback_timeline_drift_max_ms=1000.0
+            * self._source_diagnostic_value(
+                reference,
+                reference_diagnostics,
+                "callback_timeline_drift_max_s",
+                0.0,
+            ),
+            microphone_device_blocks=self._source_diagnostic_value(
+                microphone, microphone_diagnostics, "device_block_count", 0
+            ),
+            microphone_silence_blocks=self._source_diagnostic_value(
+                microphone,
+                microphone_diagnostics,
+                "synthetic_silence_block_count",
+                0,
+            ),
+            microphone_dropped_device_blocks=self._source_diagnostic_value(
+                microphone,
+                microphone_diagnostics,
+                "dropped_device_block_count",
+                0,
+            ),
+            microphone_timestamp_regressions=self._source_diagnostic_value(
+                microphone, microphone_diagnostics, "timestamp_regression_count", 0
+            ),
+            microphone_invalid_timestamps=self._source_diagnostic_value(
+                microphone, microphone_diagnostics, "invalid_timestamp_count", 0
+            ),
+            microphone_timestamp_deviation_max_ms=1000.0
+            * self._source_diagnostic_value(
+                microphone, microphone_diagnostics, "timestamp_deviation_max_s", 0.0
+            ),
+            microphone_timestamp_gap_blocks=self._source_diagnostic_value(
+                microphone, microphone_diagnostics, "timestamp_gap_block_count", 0
+            ),
+            microphone_timestamp_anomalies=self._source_diagnostic_value(
+                microphone, microphone_diagnostics, "timestamp_anomaly_count", 0
+            ),
+            microphone_callback_status_count=self._source_diagnostic_value(
+                microphone, microphone_diagnostics, "callback_status_count", 0
+            ),
+            microphone_input_overflow_count=self._source_diagnostic_value(
+                microphone, microphone_diagnostics, "input_overflow_count", 0
+            ),
+            microphone_input_underflow_count=self._source_diagnostic_value(
+                microphone, microphone_diagnostics, "input_underflow_count", 0
+            ),
+            microphone_padded_samples=self._source_diagnostic_value(
+                microphone, microphone_diagnostics, "padded_sample_count", 0
+            ),
+            microphone_callback_packet_count=self._source_diagnostic_value(
+                microphone, microphone_diagnostics, "callback_packet_count", 0
+            ),
+            microphone_callback_payload_frames=self._source_diagnostic_value(
+                microphone, microphone_diagnostics, "callback_payload_frame_count", 0
+            ),
+            microphone_callback_queue_high_watermark_blocks=self._source_diagnostic_value(
+                microphone,
+                microphone_diagnostics,
+                "callback_queue_high_watermark_blocks",
                 0
-                if reference is None
-                else getattr(reference, "callback_queue_high_watermark", 0)
-            ),
-            reference_callback_queue_age_max_ms=(
-                0.0
-                if reference is None
-                else 1000.0 * getattr(reference, "callback_queue_age_max_s", 0.0)
-            ),
-            reference_callback_enqueue_max_ms=(
-                0.0
-                if reference is None
-                else 1000.0 * getattr(reference, "callback_enqueue_max_s", 0.0)
-            ),
-            reference_callback_timeline_drift_ms=(
-                0.0
-                if reference is None
-                else 1000.0 * getattr(reference, "callback_timeline_drift_s", 0.0)
-            ),
-            reference_callback_timeline_drift_max_ms=(
-                0.0
-                if reference is None
-                else 1000.0 * getattr(reference, "callback_timeline_drift_max_s", 0.0)
-            ),
-            microphone_device_blocks=(0 if microphone is None else microphone.device_block_count),
-            microphone_silence_blocks=(
-                0 if microphone is None else microphone.synthetic_silence_block_count
-            ),
-            microphone_dropped_device_blocks=(
-                0 if microphone is None else microphone.dropped_device_block_count
-            ),
-            microphone_timestamp_regressions=(
-                0 if microphone is None else microphone.timestamp_regression_count
-            ),
-            microphone_invalid_timestamps=(
-                0 if microphone is None else microphone.invalid_timestamp_count
-            ),
-            microphone_timestamp_deviation_max_ms=(
-                0.0 if microphone is None else 1000.0 * microphone.timestamp_deviation_max_s
-            ),
-            microphone_timestamp_gap_blocks=(
-                0 if microphone is None else getattr(microphone, "timestamp_gap_block_count", 0)
-            ),
-            microphone_timestamp_anomalies=(
-                0 if microphone is None else getattr(microphone, "timestamp_anomaly_count", 0)
-            ),
-            microphone_callback_status_count=(
-                0 if microphone is None else getattr(microphone, "callback_status_count", 0)
-            ),
-            microphone_input_overflow_count=(
-                0 if microphone is None else getattr(microphone, "input_overflow_count", 0)
-            ),
-            microphone_input_underflow_count=(
-                0 if microphone is None else getattr(microphone, "input_underflow_count", 0)
-            ),
-            microphone_padded_samples=(
-                0 if microphone is None else getattr(microphone, "padded_sample_count", 0)
-            ),
-            microphone_callback_packet_count=(
-                0 if microphone is None else getattr(microphone, "callback_packet_count", 0)
-            ),
-            microphone_callback_payload_frames=(
-                0
                 if microphone is None
-                else getattr(microphone, "callback_payload_frame_count", 0)
+                else getattr(microphone, "callback_queue_high_watermark", 0),
             ),
-            microphone_callback_queue_high_watermark_blocks=(
-                0
-                if microphone is None
-                else getattr(microphone, "callback_queue_high_watermark", 0)
+            microphone_callback_queue_age_max_ms=1000.0
+            * self._source_diagnostic_value(
+                microphone, microphone_diagnostics, "callback_queue_age_max_s", 0.0
             ),
-            microphone_callback_queue_age_max_ms=(
-                0.0
-                if microphone is None
-                else 1000.0 * getattr(microphone, "callback_queue_age_max_s", 0.0)
+            microphone_callback_enqueue_max_ms=1000.0
+            * self._source_diagnostic_value(
+                microphone, microphone_diagnostics, "callback_enqueue_max_s", 0.0
             ),
-            microphone_callback_enqueue_max_ms=(
-                0.0
-                if microphone is None
-                else 1000.0 * getattr(microphone, "callback_enqueue_max_s", 0.0)
+            microphone_callback_timeline_drift_ms=1000.0
+            * self._source_diagnostic_value(
+                microphone, microphone_diagnostics, "callback_timeline_drift_s", 0.0
             ),
-            microphone_callback_timeline_drift_ms=(
-                0.0
-                if microphone is None
-                else 1000.0 * getattr(microphone, "callback_timeline_drift_s", 0.0)
-            ),
-            microphone_callback_timeline_drift_max_ms=(
-                0.0
-                if microphone is None
-                else 1000.0 * getattr(microphone, "callback_timeline_drift_max_s", 0.0)
+            microphone_callback_timeline_drift_max_ms=1000.0
+            * self._source_diagnostic_value(
+                microphone,
+                microphone_diagnostics,
+                "callback_timeline_drift_max_s",
+                0.0,
             ),
             echo_path_ready=(
                 processor_state.echo_path_ready
@@ -585,7 +964,7 @@ class AecCapture:
             echo_path_quality_ready=processor_state.echo_path_quality_ready,
             echo_suppression_db=processor_state.echo_suppression_db,
             echo_quality_s=processor_state.echo_quality_s,
-            echo_path_reset_count=processor_state.echo_path_reset_count,
+            echo_path_reset_count=getattr(processor_state, "echo_path_reset_count", 0),
             processing_mean_ms=(
                 0.0
                 if self._processed_slot_count <= 0
@@ -637,6 +1016,40 @@ class AecCapture:
             ),
             startup_unpaired_reference_blocks=(
                 snapshot.startup_unpaired_reference_blocks
+            ),
+            startup_unpaired_microphone_blocks=(
+                snapshot.startup_unpaired_microphone_blocks
+            ),
+            reference_queue_overflow_count=self._reference_queue_overflow_count,
+            microphone_queue_overflow_count=self._microphone_queue_overflow_count,
+            reference_callback_queue_overflow_count=self._source_diagnostic_value(
+                reference, reference_diagnostics, "callback_queue_overflow_count", 0
+            ),
+            microphone_callback_queue_overflow_count=self._source_diagnostic_value(
+                microphone, microphone_diagnostics, "callback_queue_overflow_count", 0
+            ),
+            microphone_fallback_used=self._source_diagnostic_value(
+                microphone, microphone_diagnostics, "fallback_used", False
+            ),
+            microphone_backend_attempt_errors=tuple(
+                self._source_diagnostic_value(
+                    microphone,
+                    microphone_diagnostics,
+                    "backend_attempt_errors",
+                    (),
+                )
+            ),
+            reference_callback_queue_high_watermark_packets=self._source_diagnostic_value(
+                reference,
+                reference_diagnostics,
+                "callback_queue_high_watermark_packets",
+                0,
+            ),
+            microphone_callback_queue_high_watermark_packets=self._source_diagnostic_value(
+                microphone,
+                microphone_diagnostics,
+                "callback_queue_high_watermark_packets",
+                0,
             ),
             hard_discontinuity_unpaired_reference_blocks=(
                 snapshot.hard_discontinuity_unpaired_reference_blocks
@@ -761,16 +1174,40 @@ class AecCapture:
         valid_samples = (
             len(block.samples) if block.valid_samples is None else block.valid_samples
         )
+        try:
+            self._reference_queue.put_nowait(block)
+        except queue.Full as exc:
+            error = AudioBackendError(
+                "reference capture queue exceeded its configured fatal capacity: "
+                f"{self._capture_queue_capacity_blocks} blocks"
+            )
+            with self._state_lock:
+                self._reference_queue_overflow_count += 1
+                if self._processing_error is None:
+                    self._processing_error = error
+            self._startup_ready.set()
+            raise error from exc
         self._reference_sample_count += valid_samples
-        self._reference_queue.put(block)
         self._startup_ready.set()
 
     def _enqueue_microphone(self, block: AudioBlock) -> None:
         valid_samples = (
             len(block.samples) if block.valid_samples is None else block.valid_samples
         )
+        try:
+            self._microphone_queue.put_nowait(block)
+        except queue.Full as exc:
+            error = AudioBackendError(
+                "microphone capture queue exceeded its configured fatal capacity: "
+                f"{self._capture_queue_capacity_blocks} blocks"
+            )
+            with self._state_lock:
+                self._microphone_queue_overflow_count += 1
+                if self._processing_error is None:
+                    self._processing_error = error
+            self._startup_ready.set()
+            raise error from exc
         self._microphone_sample_count += valid_samples
-        self._microphone_queue.put(block)
         self._startup_ready.set()
 
     def _pending_audio_seconds(self) -> tuple[float, float]:
@@ -808,14 +1245,25 @@ class AecCapture:
         )
         self._processing_thread.start()
 
-    def _stop_processing(self) -> None:
+    def _stop_processing(self) -> bool:
         self._processing_stop.set()
-        thread = self._processing_thread
-        self._processing_thread = None
-        if thread is not None:
-            thread.join(timeout=3.0)
-            if thread.is_alive() and self._processing_error is None:
-                self._processing_error = AudioBackendError("capture processing thread did not stop")
+        with self._state_lock:
+            thread = self._processing_thread
+        if thread is None:
+            return True
+        if thread is threading.current_thread():  # pragma: no cover - guarded by stop
+            return False
+        thread.join(timeout=3.0)
+        if thread.is_alive():
+            if self._processing_error is None:
+                self._processing_error = AudioBackendError(
+                    "capture processing thread did not stop"
+                )
+            return False
+        with self._state_lock:
+            if self._processing_thread is thread:
+                self._processing_thread = None
+        return True
 
     def _run_processing_guarded(self) -> None:
         try:
@@ -950,15 +1398,14 @@ class AecCapture:
         references: deque[AudioBlock],
         microphones: deque[AudioBlock],
         reference_slots: dict[int, AudioBlock],
-        limit: int,
+        reference_limit: int,
+        microphone_limit: int,
     ) -> bool:
         """Bound live AEC buffers after raw payload persistence."""
 
-        if self._artifacts is None:
-            return False
         made_progress = False
         retired_microphones: list[AudioBlock] = []
-        while len(microphones) > limit:
+        while len(microphones) > microphone_limit:
             retired_microphones.append(microphones.popleft())
         if retired_microphones:
             self._note_degraded_retirement(
@@ -967,7 +1414,7 @@ class AecCapture:
                 last_sequence=retired_microphones[-1].sequence,
             )
             made_progress = True
-        while len(references) + len(reference_slots) > limit:
+        while len(references) + len(reference_slots) > reference_limit:
             if reference_slots:
                 reference_slots.pop(min(reference_slots))
                 self._note_degraded_retirement("reference", 1)
@@ -1007,7 +1454,7 @@ class AecCapture:
             cause=cause,
             retired_blocks=count,
             last_sequence=last_sequence,
-            raw_payload_preserved=True,
+            raw_payload_preserved=self._artifacts is not None,
         )
 
     def _emit_synchronization_checkpoint(
@@ -1053,16 +1500,92 @@ class AecCapture:
         catchup_started: float | None = None
         catchup_max_backlog = 0
         next_checkpoint = time.monotonic() + 30.0
+        synchronization_wait_limit_s = min(
+            self.config.reference_stall_grace_s,
+            self.config.queue_fatal_s,
+        )
+        fatal_capacity_blocks = self._capture_queue_capacity_blocks
+        fatal_backlog = False
+        fatal_spooled_reference_blocks = 0
+        fatal_spooled_microphone_blocks = 0
         buffer_limit = max(
             1,
-            round(self.config.reference_stall_grace_s / self.config.block_duration_s),
+            math.ceil(synchronization_wait_limit_s / self.config.block_duration_s),
         )
         poll_s = min(0.005, self.config.block_duration_s / 4.0)
         while True:
             stopping = self._processing_stop.is_set()
             reference_failed = self._note_reference_failure(phase="runtime") is not None
             microphone_failed = self._note_microphone_failure(phase="runtime") is not None
-            while True:
+            if not fatal_backlog and self._processing_error is not None:
+                fatal_backlog = True
+                self._emit(
+                    "capture_failed",
+                    phase="processing",
+                    error=str(self._processing_error),
+                )
+            if fatal_backlog:
+                while True:
+                    try:
+                        received_reference = self._reference_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if self._artifacts is not None:
+                        valid_samples = (
+                            len(received_reference.samples)
+                            if received_reference.valid_samples is None
+                            else received_reference.valid_samples
+                        )
+                        self._artifacts.write_reference_received(
+                            received_reference.samples[:valid_samples]
+                        )
+                    fatal_spooled_reference_blocks += 1
+                while True:
+                    try:
+                        received_microphone = self._microphone_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if self._artifacts is not None:
+                        valid_samples = (
+                            len(received_microphone.samples)
+                            if received_microphone.valid_samples is None
+                            else received_microphone.valid_samples
+                        )
+                        self._artifacts.write_microphone_received(
+                            received_microphone.samples[:valid_samples]
+                        )
+                    fatal_spooled_microphone_blocks += 1
+                self._set_internal_pending_counts(
+                    references,
+                    microphones,
+                    reference_slots,
+                )
+                if stopping:
+                    pending = self._aligner.drain_pending_references()
+                    self._aligner.note_shutdown_unpaired(
+                        "reference",
+                        len(references)
+                        + len(reference_slots)
+                        + len(pending)
+                        + fatal_spooled_reference_blocks,
+                    )
+                    self._aligner.note_shutdown_unpaired(
+                        "microphone",
+                        len(microphones) + fatal_spooled_microphone_blocks,
+                    )
+                    with self._state_lock:
+                        self._internal_reference_pending_blocks = 0
+                        self._internal_microphone_pending_blocks = 0
+                    return
+                self._processing_stop.wait(poll_s)
+                continue
+
+            reference_internal_blocks = (
+                len(references)
+                + len(reference_slots)
+                + self._aligner.pending_reference_count
+            )
+            while stopping or reference_internal_blocks < fatal_capacity_blocks:
                 try:
                     received_reference = self._reference_queue.get_nowait()
                 except queue.Empty:
@@ -1077,7 +1600,9 @@ class AecCapture:
                         received_reference.samples[:valid_samples]
                     )
                 references.append(received_reference)
-            while True:
+                reference_internal_blocks += 1
+            microphone_internal_blocks = len(microphones)
+            while stopping or microphone_internal_blocks < fatal_capacity_blocks:
                 try:
                     microphone = self._microphone_queue.get_nowait()
                 except queue.Empty:
@@ -1092,6 +1617,7 @@ class AecCapture:
                         microphone.samples[:valid_samples]
                     )
                 microphones.append(microphone)
+                microphone_internal_blocks += 1
 
             self._set_internal_pending_counts(references, microphones, reference_slots)
             now = time.monotonic()
@@ -1127,11 +1653,7 @@ class AecCapture:
                     None,
                 )
                 if microphone_barrier is not None or reference_barrier is not None:
-                    old_microphones = (
-                        len(microphones)
-                        if microphone_barrier is None
-                        else microphone_barrier
-                    )
+                    old_microphones = 0 if microphone_barrier is None else microphone_barrier
                     for _index in range(old_microphones):
                         microphones.popleft()
                     old_references = len(reference_slots)
@@ -1140,6 +1662,11 @@ class AecCapture:
                         old_references += reference_barrier
                         for _index in range(reference_barrier):
                             references.popleft()
+                    elif microphone_barrier is not None:
+                        # Without a reference-side epoch marker, no queued
+                        # reference can be proven to belong after the mic barrier.
+                        old_references += len(references)
+                        references.clear()
                     if old_microphones:
                         self._aligner.note_hard_discontinuity_unpaired(
                             "microphone",
@@ -1151,9 +1678,8 @@ class AecCapture:
                             old_references,
                         )
                     observed_microphone_sequence = None
-                    slot_hard_discontinuity = False
                     synchronization_wait = None
-                    made_progress = True
+                    made_progress = bool(old_microphones or old_references)
 
             # With a confirmed mapping, references can be assigned by sequence
             # while the microphone callback is the delayed source.
@@ -1177,6 +1703,12 @@ class AecCapture:
                 if observed_microphone_sequence != slot:
                     update = self._aligner.observe_microphone(microphone)
                     if update.hard_discontinuity:
+                        if not slot_hard_discontinuity:
+                            self._emit(
+                                "alignment_discontinuity_pending",
+                                source="microphone",
+                                sequence=microphone.sequence,
+                            )
                         self._requeue_invalidated_references(
                             update,
                             slot=slot,
@@ -1200,7 +1732,12 @@ class AecCapture:
                     candidate = references[0]
                     hint = self._aligner.reference_slot_hint(candidate)
                     stable_mapping = self._aligner.reference_offset is not None
-                    if stable_mapping and candidate.discontinuity and hint != slot:
+                    if (
+                        stable_mapping
+                        and candidate.discontinuity
+                        and hint != slot
+                        and self._aligner.mode is not AlignmentMode.DEGRADED
+                    ):
                         break
                     if hint is None and not stable_mapping:
                         break
@@ -1214,10 +1751,25 @@ class AecCapture:
                         and hint > slot
                         and (
                             not joining
-                            or hint
-                            > slot
-                            + self._aligner.JOIN_HORIZON_BLOCKS
-                            + self._aligner.pending_reference_count
+                            or (
+                                hint
+                                > (
+                                    self._aligner.join_validation_microphone_sequence
+                                    if self._aligner.join_validation_microphone_sequence
+                                    is not None
+                                    else slot
+                                )
+                                + (
+                                    0
+                                    if self._aligner.join_validation_microphone_barrier
+                                    else self._aligner.JOIN_HORIZON_BLOCKS
+                                )
+                                + (
+                                    0
+                                    if self._aligner.join_validation_microphone_barrier
+                                    else self._aligner.pending_reference_count
+                                )
+                            )
                             or candidate.discontinuity
                         )
                     ):
@@ -1225,6 +1777,12 @@ class AecCapture:
                     references.popleft()
                     update = self._aligner.ingest_reference(candidate)
                     if update.hard_discontinuity:
+                        if not slot_hard_discontinuity:
+                            self._emit(
+                                "alignment_discontinuity_pending",
+                                source="reference",
+                                sequence=candidate.sequence,
+                            )
                         self._discard_invalidated_references(
                             update,
                             slot=slot,
@@ -1284,12 +1842,8 @@ class AecCapture:
 
                 # A confirmed initial map can prove that the reference source
                 # started after the microphone. Those leading microphone slots
-                # can never receive a real counterpart: every earlier reference
-                # sequence has already been mapped. Emit them immediately with
-                # an explicit absent/zero far-end channel so early speech is
-                # preserved without pairing it to stale system audio. This is
-                # startup-only; a missing reference after the first real pair
-                # still enters the synchronization reserve below.
+                # can never receive a real counterpart. Retire them explicitly;
+                # raw source artifacts already preserve their actual payload.
                 if (
                     self._aligner.alignment_ready
                     and self._aligner.snapshot.pair_count == 0
@@ -1297,15 +1851,14 @@ class AecCapture:
                     and min(reference_slots) > slot
                 ):
                     microphones.popleft()
-                    self._process_master_slot(reference=None, microphone=microphone)
+                    self._aligner.note_startup_unpaired_microphone(1)
                     observed_microphone_sequence = None
-                    slot_hard_discontinuity = False
                     made_progress = True
                     continue
 
                 if self._aligner.mode is AlignmentMode.DEGRADED and reference_slots:
                     earliest_reference_slot = min(reference_slots)
-                    if earliest_reference_slot > slot and self._artifacts is not None:
+                    if earliest_reference_slot > slot:
                         microphones.popleft()
                         self._note_degraded_retirement(
                             "microphone",
@@ -1313,7 +1866,6 @@ class AecCapture:
                             last_sequence=microphone.sequence,
                         )
                         observed_microphone_sequence = None
-                        slot_hard_discontinuity = False
                         made_progress = True
                         continue
 
@@ -1335,7 +1887,7 @@ class AecCapture:
                 reason = None
                 if reference_failed:
                     reason = "source_failure"
-                elif elapsed >= self.config.reference_stall_grace_s:
+                elif elapsed >= synchronization_wait_limit_s:
                     reason = "wait_timeout"
                 if reason is not None and self._aligner.mark_synchronization_degraded():
                     self._report_synchronization_wait(synchronization_wait)
@@ -1375,6 +1927,7 @@ class AecCapture:
                         maximum_backlog_blocks=(
                             synchronization_wait.max_backlog_blocks
                         ),
+                        effective_wait_limit_s=synchronization_wait_limit_s,
                         reset_apm=False,
                     )
                     synchronization_wait = None
@@ -1399,7 +1952,7 @@ class AecCapture:
                 reason = None
                 if microphone_failed:
                     reason = "source_failure"
-                elif elapsed >= self.config.reference_stall_grace_s:
+                elif elapsed >= synchronization_wait_limit_s:
                     reason = "wait_timeout"
                 if reason is not None and self._aligner.mark_synchronization_degraded():
                     self._report_synchronization_wait(synchronization_wait)
@@ -1439,6 +1992,7 @@ class AecCapture:
                         maximum_backlog_blocks=(
                             synchronization_wait.max_backlog_blocks
                         ),
+                        effective_wait_limit_s=synchronization_wait_limit_s,
                         reset_apm=False,
                     )
                     synchronization_wait = None
@@ -1448,7 +2002,16 @@ class AecCapture:
                     references=references,
                     microphones=microphones,
                     reference_slots=reference_slots,
-                    limit=buffer_limit,
+                    reference_limit=max(
+                        0,
+                        buffer_limit
+                        - self._reference_queue.qsize()
+                        - self._aligner.pending_reference_count,
+                    ),
+                    microphone_limit=max(
+                        0,
+                        buffer_limit - self._microphone_queue.qsize(),
+                    ),
                 )
                 if retired:
                     if (
@@ -1457,6 +2020,27 @@ class AecCapture:
                     ):
                         observed_microphone_sequence = None
                     made_progress = True
+
+            if not stopping:
+                reference_total_blocks = (
+                    len(references)
+                    + len(reference_slots)
+                    + self._aligner.pending_reference_count
+                    + self._reference_queue.qsize()
+                )
+                microphone_total_blocks = len(microphones) + self._microphone_queue.qsize()
+                if max(reference_total_blocks, microphone_total_blocks) > fatal_capacity_blocks:
+                    error = AudioBackendError(
+                        "capture processing backlog exceeded the configured fatal limit: "
+                        f"reference={reference_total_blocks * self.config.block_duration_s:.3f}s "
+                        f"microphone={microphone_total_blocks * self.config.block_duration_s:.3f}s"
+                    )
+                    with self._state_lock:
+                        if self._processing_error is None:
+                            self._processing_error = error
+                    self._emit("capture_failed", phase="processing", error=str(error))
+                    fatal_backlog = True
+                    continue
 
             backlog = len(microphones) + len(references) + len(reference_slots)
             if catchup_started is not None:
@@ -1502,19 +2086,12 @@ class AecCapture:
         references: deque[AudioBlock],
         reference_slots: dict[int, AudioBlock],
     ) -> None:
-        """Return only unprocessed old-epoch references to source order."""
+        """Retire every reference already mapped under the invalidated epoch."""
 
-        recycled = list(update.unmapped)
-        for mapped_slot in sorted(key for key in reference_slots if key >= slot):
-            recycled.append(reference_slots.pop(mapped_slot))
-        existing_sequences = {block.sequence for block in references}
-        unique = {
-            block.sequence: block
-            for block in recycled
-            if block.sequence not in existing_sequences
-        }
-        for block in reversed(sorted(unique.values(), key=lambda item: item.sequence)):
-            references.appendleft(block)
+        del slot, references
+        retired = len(update.unmapped) + len(reference_slots)
+        reference_slots.clear()
+        self._aligner.note_hard_discontinuity_unpaired("reference", retired)
 
     def _discard_invalidated_references(
         self,
@@ -1529,12 +2106,12 @@ class AecCapture:
             "reference",
             len(update.unmapped),
         )
-        invalidated = sorted(key for key in reference_slots if key >= slot)
-        for mapped_slot in invalidated:
-            reference_slots.pop(mapped_slot)
+        del slot
+        invalidated = len(reference_slots)
+        reference_slots.clear()
         self._aligner.note_hard_discontinuity_unpaired(
             "reference",
-            len(invalidated),
+            invalidated,
         )
 
     def _apply_alignment_update(
@@ -1618,32 +2195,19 @@ class AecCapture:
     def _process_master_slot(
         self,
         *,
-        reference: AudioBlock | None,
+        reference: AudioBlock,
         microphone: AudioBlock,
     ) -> None:
-        """Advance once for a confirmed pair or explicit startup mic-only slot."""
+        """Advance the processed timeline exactly once for one confirmed pair."""
 
         if self._processor is None:  # pragma: no cover - guarded by start
             raise CaptureStateError("AEC processor is not initialized")
         worker_started = time.perf_counter()
+        reference_samples = reference.samples
         microphone_samples = microphone.samples
-        reference_present = reference is not None
-        reference_samples = (
-            reference.samples
-            if reference is not None
-            else (0.0,) * len(microphone_samples)
-        )
         ended = microphone.ended_monotonic
-        pair_skew = (
-            0.0
-            if reference is None
-            else self._aligner.event_end(reference) - self._aligner.event_end(microphone)
-        )
-        recovered = False
-        if reference is None:
-            self._aligner.note_zero_filled_reference(1)
-        else:
-            recovered = self._aligner.note_pair(reference, microphone)
+        pair_skew = self._aligner.event_end(reference) - self._aligner.event_end(microphone)
+        recovered = self._aligner.note_pair(reference, microphone)
         if recovered:
             self._emit(
                 "alignment_recovered",
@@ -1664,7 +2228,6 @@ class AecCapture:
             echo_path_ready=(
                 processor_state.echo_path_ready
                 and self._aligner.alignment_ready
-                and reference_present
             ),
             far_end_active_s=processor_state.far_end_active_s,
             alignment_epoch=processor_state.alignment_epoch,
@@ -1672,7 +2235,7 @@ class AecCapture:
             echo_path_quality_ready=processor_state.echo_path_quality_ready,
             echo_suppression_db=processor_state.echo_suppression_db,
             echo_quality_s=processor_state.echo_quality_s,
-            echo_path_reset_count=processor_state.echo_path_reset_count,
+            echo_path_reset_count=getattr(processor_state, "echo_path_reset_count", 0),
         )
         self.on_frame(
             AecFrame(
@@ -1683,12 +2246,10 @@ class AecCapture:
                 microphone_ended_monotonic=ended,
                 pair_skew_s=pair_skew,
                 state=state,
-                reference_present=reference_present,
+                reference_present=True,
                 microphone_present=True,
                 reference_observed_end_monotonic=(
-                    reference.observed_end_monotonic
-                    if reference is not None and reference.timing_valid
-                    else None
+                    reference.observed_end_monotonic if reference.timing_valid else None
                 ),
                 microphone_observed_end_monotonic=(
                     microphone.observed_end_monotonic if microphone.timing_valid else None

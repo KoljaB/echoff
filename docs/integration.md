@@ -19,7 +19,8 @@ far-end reference and near-end microphone as distinct inputs.
 
 ## Echoff owns the devices
 
-`AecCapture` is the recommended live path on Windows:
+`AecCapture` is the recommended live path on Windows and Linux. With
+`AecConfig(backend="auto")`, it selects WASAPI on Windows and PipeWire on Linux:
 
 ```python
 import time
@@ -31,8 +32,8 @@ frames: Queue[AecFrame] = Queue()
 capture = AecCapture(
     AecConfig(),
     on_frame=frames.put,
-    reference_device=None,   # default WASAPI loopback endpoint
-    microphone_device=None,  # default WASAPI microphone
+    reference_device=None,   # default platform reference endpoint
+    microphone_device=None,  # default platform microphone
 )
 
 capture.start()
@@ -63,9 +64,9 @@ do not stop audio processing.
 Use `on_reference(samples, ended_monotonic)` when the application also consumes
 the reference from each confirmed pair. Echoff emits no synthetic reference
 callback for an unmatched microphone block. The diagnostic
-`reference_received.wav` preserves every received raw reference payload. Use
-`on_event(event)` for low-volume
-structured lifecycle and alignment telemetry.
+`reference_received.wav` (when artifacts are enabled) preserves every received
+raw reference payload. Use `on_event(event)` for low-volume structured lifecycle
+and alignment telemetry.
 
 ### Lifecycle and health
 
@@ -84,7 +85,9 @@ structured lifecycle and alignment telemetry.
   processing/callback failure or unsafe unbounded backlog remains fatal.
 
 If `output_dir` is set, Echoff reserves the artifact filenames exclusively and
-never overwrites an earlier run. Use a new directory per capture.
+never overwrites an earlier run. Use a new directory per capture. Final capture
+status is `completed`, `incomplete`, `degraded`, or `failed`; probe callers treat
+anything other than `completed` as unsuccessful while retaining artifacts.
 
 Call `record_event()` while capture is running if the event must be persisted to
 `events.jsonl`; outside the artifact lifetime it can still reach `on_event` but

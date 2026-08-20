@@ -32,14 +32,20 @@ before diagnosing packaging.
 
 ## No devices are listed
 
-1. Confirm the command is running on Windows.
-2. Confirm `PyAudioWPatch` is installed in the same environment.
-3. Confirm Windows sees an enabled default output and microphone.
+1. Confirm the command is running on Windows or Linux; macOS has no built-in
+   capture backend.
+2. On Windows, confirm `PyAudioWPatch` and `sounddevice` are installed in the
+   same environment. On Linux, confirm `pactl`, `pw-dump`, and `pw-record` are
+   installed and the PipeWire session is running.
+3. Confirm the OS sees an enabled output and microphone/source.
 4. Close applications using a device exclusively, then retry.
 5. Run `python -m echoff devices --json` and preserve the error output.
 
-`devices` lists selectable WASAPI endpoints. WDM-KS microphone fallback is
-automatic after a WASAPI open failure and is not independently listed.
+`devices` lists platform-specific selectable endpoints: Windows WASAPI loopback
+references/microphones or Linux PipeWire sink monitors/sources. The optional
+WDM-KS microphone fallback on Windows is considered only after a unique
+normalized physical-name match and successful start; it is not independently
+listed, and a failed start is never reported as selected.
 
 ## A device selector is ambiguous or not found
 
@@ -63,10 +69,11 @@ merely to force a lock; that can pair different audio intervals.
 
 ## `computer_audio.wav` is silent or contains the wrong application
 
-The selected loopback endpoint must be the endpoint that actually drives the
-speakers. Windows may route an application to a non-default device. Run
-`devices`, select the correct reference index explicitly, and verify the WAV
-before interpreting AEC quality.
+The selected loopback endpoint or PipeWire sink monitor must be the endpoint that
+actually drives the speakers. Windows may route an application to a non-default
+device, and Linux may expose several sink monitors. Run `devices`, select the
+correct reference index explicitly, and verify the WAV before interpreting AEC
+quality.
 
 Exclusive-mode or protected playback may not appear in shared-mode loopback.
 
@@ -151,7 +158,7 @@ application-owned aligned PCM. See [Platform support](platforms.md).
 
 ## Before filing an issue
 
-Include package/Python/Windows versions, the command, redacted `config.json`,
+Include package/Python/OS versions, the command, redacted `config.json`,
 `summary.json`, relevant event rows, and whether the raw mic had far-end
 exposure. Do not attach raw audio publicly without reviewing its private
 content.
