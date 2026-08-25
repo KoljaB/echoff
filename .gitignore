@@ -15,3 +15,4 @@ captures/
 !assets/reference_signal.wav
 *.jsonl
 run.log
+.codex-remote-attachments/
