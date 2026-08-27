@@ -17,3 +17,22 @@
   `examples/` or the `echoff record` command and always preserve artifacts.
 - Keep source modules focused. Split a module before it becomes responsible for
   unrelated concerns.
+
+## Release
+
+- Before building a release, run the cheap worktree guard:
+  `python tools/release_guard.py check-worktrees --repo .`.
+  A dirty main checkout or linked worktree is a hard release blocker.
+- The release wheel must be attested against the exact Miep runtime that will
+  use Echoff. Run `release_guard.py attest` with `--package-dir echoff`,
+  `--source-package-dir src/echoff`, that runtime's Python/import path, the
+  mandatory wheel and sdist, and the local private signing key. The detached
+  signature expires for publication after 30 minutes.
+- Every TestPyPI or PyPI upload must go through
+  `python tools/release_guard.py publish`; invoke neither `twine upload` nor a
+  wildcard upload directly. If the guard fails, stop and reconcile the runtime
+  before publishing.
+- Do not rebuild or replace the attested wheel or sdist after `attest`. A
+  changed source commit, linked worktree, runtime import/file, artifact hash,
+  signature, remote `main`/tag, or package-index roundtrip must block the
+  release.
