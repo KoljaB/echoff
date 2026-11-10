@@ -47,8 +47,8 @@ acceptance areas in [Development](docs/development.md) before support is claimed
 
 ## Scope and licensing
 
-Avoid unrelated cleanup in a focused change. Echoff is licensed under the MIT
-License. By contributing, you agree that your contribution may be distributed
+Avoid unrelated cleanup in a focused change. Echoff is licensed under the Apache
+License 2.0. By contributing, you agree that your contribution may be distributed
 under that license.
 
 See the [documentation index](docs/README.md), [architecture](docs/architecture.md),

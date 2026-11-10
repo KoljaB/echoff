@@ -51,4 +51,4 @@ Windows and Linux. Linux live capture requires PipeWire command-line tools.
 The macOS processor path is designed for applications that already own
 correctly aligned PCM and environments where LiveKit installs, but it is not
 CI- or hardware-qualified and built-in macOS capture is not implemented. The
-repository is licensed under the [MIT License](../LICENSE).
+repository is licensed under the [Apache License 2.0](../LICENSE).

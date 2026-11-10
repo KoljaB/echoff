@@ -2,7 +2,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/echoff.svg)](https://pypi.org/project/echoff/)
 [![Python](https://img.shields.io/pypi/pyversions/echoff.svg)](https://pypi.org/project/echoff/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/KoljaB/echoff/blob/main/LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-green.svg)](https://github.com/KoljaB/echoff/blob/main/LICENSE)
 [![Typed](https://img.shields.io/badge/typing-py.typed-2f74c0)](https://peps.python.org/pep-0561/)
 [![Live capture](https://img.shields.io/badge/live_capture-Windows%20%7C%20Linux-0078d4)](https://github.com/KoljaB/echoff/blob/main/docs/platforms.md)
 
@@ -313,4 +313,4 @@ for the editable install, deterministic tests, and hardware-evidence contract.
 
 ## License
 
-Echoff is open source under the [MIT License](https://github.com/KoljaB/echoff/blob/main/LICENSE).
+Echoff is open source under the [Apache License 2.0](https://github.com/KoljaB/echoff/blob/main/LICENSE). Releases up to and including 0.3.0 were published under the MIT License.
